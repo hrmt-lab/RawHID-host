@@ -7,13 +7,18 @@ use std::{
     time::Instant,
 };
 
+use rawhid_host_core::claude_decision::ClaudePermissionGate;
 use rawhid_host_core::codex_activity::CodexSessionSnapshot;
 use rawhid_host_core::config::{ActionBinding, HostActionKind};
+use rawhid_host_core::pending_approval::ApprovalClient;
 use tauri::{AppHandle, Manager};
 
 use crate::state::{AiDisplayTarget, MonitorStatus};
 use crate::{
-    commands::{respond_to_codex_approval_internal, spawn_ai_refresh_watcher, MonitorExtras},
+    commands::{
+        respond_to_claude_approval_internal, respond_to_codex_approval_internal,
+        spawn_ai_refresh_watcher, MonitorExtras,
+    },
     hud_coordinator::HudSelectionDirection,
 };
 
@@ -173,7 +178,12 @@ pub fn execute(
             };
             // `respond_to_approval` may wait for the App Server response.
             // Never make the Host Link monitor loop wait for that round trip.
-            dispatch_hud_response(pending, extras.codex_broker.clone(), dispatch);
+            dispatch_hud_response(
+                pending,
+                extras.codex_broker.clone(),
+                Arc::clone(&extras.claude_permission_gate),
+                dispatch,
+            );
             let slot = target_thread.and_then(|target| resolve_hud_target_slot(extras, &target));
             match slot {
                 Some(slot) => Ok(ActionOutcome::HudResponded { slot }),
@@ -361,6 +371,7 @@ pub(crate) fn codex_target_for_slot(
 fn dispatch_hud_response(
     pending: Arc<rawhid_host_core::pending_approval::PendingApprovalStore>,
     broker: rawhid_host_core::codex_broker::CodexBrokerManager,
+    claude_permission_gate: Arc<ClaudePermissionGate>,
     dispatch: crate::hud_coordinator::HudResponseDispatch,
 ) {
     // `Builder::spawn` returns an error rather than panicking on the usual
@@ -369,10 +380,17 @@ fn dispatch_hud_response(
     let _ = std::thread::Builder::new()
         .name("hud-approval-response".to_string())
         .spawn(move || {
-            // A duplicate press or a CLI-first response is expected to lose the
-            // Broker first-wins race. The monitor already recorded dispatch, and
-            // there is no safe recovery action for a stale physical packet.
-            let _ = dispatch_hud_response_selection(&pending, &broker, &dispatch.selection);
+            // A duplicate press, a CLI-first Codex response, or a
+            // terminal-first Claude Code answer is expected to lose its
+            // respective first-wins race. The monitor already recorded
+            // dispatch, and there is no safe recovery action for a stale
+            // physical packet.
+            let _ = dispatch_hud_response_selection(
+                &pending,
+                &broker,
+                &claude_permission_gate,
+                &dispatch.selection,
+            );
         });
 }
 
@@ -380,17 +398,37 @@ fn dispatch_hud_response(
 /// atomically chosen one exact pending request. Keeping this separate from
 /// the thread spawn lets tests exercise the same Host dispatcher without a
 /// Tauri window or a physical HID packet.
+///
+/// Routes on the entry's `client`: a Codex request always goes to the
+/// Broker's first-wins response path, and a Claude Code request always goes
+/// to `claude_permission_gate` -- never the other way around. A key whose
+/// entry has already been resolved (evicted from `pending` by the time this
+/// runs) falls through to `Err`, exactly as it did before this split
+/// existed.
 pub(crate) fn dispatch_hud_response_selection(
     pending: &rawhid_host_core::pending_approval::PendingApprovalStore,
     broker: &rawhid_host_core::codex_broker::CodexBrokerManager,
+    claude_permission_gate: &ClaudePermissionGate,
     selection: &crate::hud_coordinator::HudApprovalSelection,
 ) -> Result<bool, String> {
-    respond_to_codex_approval_internal(
-        pending,
-        broker,
-        selection.key.token(),
-        selection.decision_index,
-    )
+    let client = pending
+        .get(&selection.key)
+        .ok_or_else(|| "The approval is no longer available".to_string())?
+        .client;
+    match client {
+        ApprovalClient::Codex => respond_to_codex_approval_internal(
+            pending,
+            broker,
+            selection.key.token(),
+            selection.decision_index,
+        ),
+        ApprovalClient::ClaudeCode => respond_to_claude_approval_internal(
+            pending,
+            claude_permission_gate,
+            selection.key.token(),
+            selection.decision_index,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +445,7 @@ mod tests {
 
     use futures_util::{SinkExt, StreamExt};
     use rawhid_host_core::{
+        claude_decision::ClaudePermissionGate,
         codex_activity::{AiClientStateSnapshot, CodexActivityRuntime, CodexSessionSnapshot},
         codex_broker::{test_support::BrokerHarness, CodexApprovalResponseOutcome},
         packet::{AiActivityState, AiClientType, AiClientVariant, AiWorkPhase},
@@ -423,7 +462,10 @@ mod tests {
     };
 
     use crate::{
-        hud_coordinator::{response_selection_from_state, HudInteractionState, HUD_CONFIRM_GUARD},
+        hud_coordinator::{
+            response_selection_from_state, HudInteractionState, HudSelectionDirection,
+            HUD_CONFIRM_GUARD,
+        },
         state::AiDisplayTarget,
     };
 
@@ -538,6 +580,7 @@ mod tests {
                 available_decisions: Some(vec![json!("approve")]),
                 tool_use_id: None,
                 prompt_id: None,
+                permission_suggestions: None,
             },
         );
 
@@ -574,6 +617,72 @@ mod tests {
             vec![idle_snapshot],
         )
         .is_none());
+    }
+
+    /// Stage 3's HUD-side arbitration boundary: a Claude Code selection must
+    /// go to `ClaudePermissionGate` and never touch the Codex Broker at all,
+    /// symmetric to Codex requests never touching the gate. Uses a bare
+    /// `CodexBrokerManager::new()` with nothing connected to it -- if this
+    /// routing were ever wrong, the Broker call would simply fail rather
+    /// than silently succeed, so this doubles as a check that the Broker
+    /// path is not taken.
+    #[test]
+    fn dispatch_hud_response_selection_routes_a_claude_request_to_the_gate_not_the_broker() {
+        use rawhid_host_core::{
+            claude_decision::{ClaudeDecision, CLAUDE_HUD_DENY_MESSAGE},
+            pending_approval::{claude_key, CLAUDE_DECISION_ALLOW, CLAUDE_DECISION_DENY},
+        };
+
+        let pending = PendingApprovalStore::new();
+        let key = claude_key("launch-1", "session-1");
+        pending.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            PendingApprovalBody {
+                primary_text: None,
+                full_command: None,
+                reason: None,
+                cwd: None,
+                kind: None,
+                available_decisions: Some(vec![
+                    json!(CLAUDE_DECISION_ALLOW),
+                    json!(CLAUDE_DECISION_DENY),
+                ]),
+                tool_use_id: None,
+                prompt_id: None,
+                permission_suggestions: None,
+            },
+        );
+
+        let gate = ClaudePermissionGate::default();
+        let waiter = gate.register(key.token().to_string());
+        // Never started, never connected -- any attempt to route through it
+        // would fail rather than pass silently.
+        let unused_broker = rawhid_host_core::codex_broker::CodexBrokerManager::new();
+
+        let selection = crate::hud_coordinator::HudApprovalSelection {
+            key: key.clone(),
+            decision_index: 1, // CLAUDE_DECISION_DENY
+        };
+
+        assert_eq!(
+            super::dispatch_hud_response_selection(&pending, &unused_broker, &gate, &selection),
+            Ok(true)
+        );
+        assert_eq!(
+            waiter.blocking_recv(),
+            Ok(ClaudeDecision::Deny {
+                message: CLAUDE_HUD_DENY_MESSAGE.to_string()
+            })
+        );
+        assert!(
+            pending.get(&key).is_none(),
+            "the entry must be resolved once answered"
+        );
     }
 
     async fn receive_json<Stream>(socket: &mut tokio_tungstenite::WebSocketStream<Stream>) -> Value
@@ -615,6 +724,11 @@ mod tests {
         .unwrap();
         let manager = harness.manager();
         let activity = CodexActivityRuntime::start(manager.clone());
+        // Every request in this E2E is Codex's, so this gate is never
+        // actually answered -- it exists only because
+        // `dispatch_hud_response_selection` now branches on the entry's
+        // client and needs somewhere to route a Claude Code answer to.
+        let claude_permission_gate = ClaudePermissionGate::default();
         let upstream = tokio::spawn(async move {
             let (upstream_socket, _) = upstream_listener.accept().await.unwrap();
             accept_async(upstream_socket).await.unwrap()
@@ -730,7 +844,13 @@ mod tests {
                 .expect("400 ms guard releases the selected exact decision");
         assert_eq!(selection.key, selected_key);
         assert_eq!(selection.decision_index, 0);
-        assert!(super::dispatch_hud_response_selection(&pending, &manager, &selection).unwrap());
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &manager,
+            &claude_permission_gate,
+            &selection
+        )
+        .unwrap());
         let host_response = receive_json(&mut app_server).await;
         assert_eq!(host_response["id"], 102);
         assert_eq!(host_response["result"]["decision"], "approve-b");
@@ -811,7 +931,13 @@ mod tests {
         )
         .expect("guard-elapsed confirm sends whatever reject moved the highlight to");
         assert_eq!(reject.decision_index, 1);
-        assert!(super::dispatch_hud_response_selection(&pending, &manager, &reject).unwrap());
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &manager,
+            &claude_permission_gate,
+            &reject
+        )
+        .unwrap());
         let decline_response = receive_json(&mut app_server).await;
         assert_eq!(decline_response["id"], 104);
         assert_eq!(decline_response["result"]["decision"], "decline");
@@ -846,9 +972,13 @@ mod tests {
         )
         .expect("guard-elapsed confirm sends the reject-moved-to cancel index");
         assert_eq!(cancel_selection.decision_index, 1);
-        assert!(
-            super::dispatch_hud_response_selection(&pending, &manager, &cancel_selection).unwrap()
-        );
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &manager,
+            &claude_permission_gate,
+            &cancel_selection
+        )
+        .unwrap());
         let cancel_response = receive_json(&mut app_server).await;
         assert_eq!(cancel_response["id"], 105);
         assert_eq!(cancel_response["result"]["decision"], "cancel");
@@ -875,5 +1005,236 @@ mod tests {
         assert!(response_selection_from_state(&hud_state, &pending, Instant::now()).is_none());
         drop(activity);
         harness.shutdown().await.unwrap();
+    }
+
+    /// Claude Code counterpart to
+    /// `host_approval_lifecycle_e2e_uses_real_broker_and_selected_thread_only`
+    /// above. A real `ClaudeObserverReceiver` receives a real HTTP
+    /// `PermissionRequest`; the real `ClaudeApprovalBodyConsumer` feeds the
+    /// real `PendingApprovalStore`; the real `HudInteractionState` observes
+    /// its own 400 ms guard; and the real `dispatch_hud_response_selection`
+    /// answers through `ClaudePermissionGate` -- ending with the exact HTTP
+    /// response Claude Code itself would receive. `unused_broker` is never
+    /// started or connected, so if Claude's answer were ever misrouted to
+    /// it (the bug `dispatch_hud_response_selection`'s client branch
+    /// exists to prevent), the call would fail loudly rather than silently
+    /// succeed.
+    ///
+    /// The second half covers §9.4's first-wins rule for Claude Code: a
+    /// session whose terminal answers first (observed here as the
+    /// `PostToolUse` hook that fires once an approved tool actually runs)
+    /// must leave its still-open hook connection to degrade to 204 on its
+    /// own, and a HUD confirm arriving after that point must find nothing
+    /// left to answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_permission_request_e2e_uses_real_receiver_consumer_and_gate() {
+        use rawhid_host_core::{
+            claude_activity::ClaudeApprovalBodyConsumer,
+            claude_decision::CLAUDE_HUD_DENY_MESSAGE,
+            claude_hook_event::{ClaudeHookEvent, ClaudeObserverEvent},
+            claude_observer::{ClaudeObserverReceiver, ClaudeObserverReceiverOptions},
+            pending_approval::claude_key,
+        };
+
+        let token = "0123456789abcdef0123456789abcdef";
+        let gate = std::sync::Arc::new(ClaudePermissionGate::default());
+        let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+        options.permission_gate = gate.clone();
+        options.permission_decision_timeout = Duration::from_secs(5);
+        let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+        let pending = PendingApprovalStore::new();
+        let consumer = ClaudeApprovalBodyConsumer;
+        let unused_broker = rawhid_host_core::codex_broker::CodexBrokerManager::new();
+
+        fn permission_request_body(session_id: &str, command: &str) -> Value {
+            json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "C:\\work",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": command}
+            })
+        }
+
+        // --- HUD wins: a real deny answer flows all the way back through
+        // the hook's HTTP response, carrying the fixed `CLAUDE_HUD_DENY_MESSAGE`
+        // (see `ClaudeDecision`'s doc comment on why that string is fixed).
+        let endpoint = receiver.config().endpoint.clone();
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&endpoint)
+                .bearer_auth(token)
+                .json(&permission_request_body("session-1", "mkdir foo"))
+                .send()
+                .await
+                .unwrap()
+        });
+        let event = events.recv().await.unwrap();
+        consumer.ingest(&pending, &gate, &event);
+
+        let key = claude_key("launch-1", "session-1");
+        let shown_at = Instant::now();
+        let mut hud_state = HudInteractionState::default();
+        hud_state.sync_target(Some(&key), 2, shown_at);
+        // Move the highlight from the default allow (index 0) to deny
+        // (index 1) before confirming.
+        assert_eq!(
+            hud_state.move_selection(2, HudSelectionDirection::Next),
+            Some(1)
+        );
+
+        assert!(response_selection_from_state(
+            &hud_state,
+            &pending,
+            shown_at + HUD_CONFIRM_GUARD - Duration::from_nanos(1)
+        )
+        .is_none());
+        let selection =
+            response_selection_from_state(&hud_state, &pending, shown_at + HUD_CONFIRM_GUARD)
+                .expect("400 ms guard releases the selected decision");
+        assert_eq!(selection.decision_index, 1);
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &unused_broker,
+            &gate,
+            &selection
+        )
+        .unwrap());
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "deny",
+                        "message": CLAUDE_HUD_DENY_MESSAGE
+                    }
+                }
+            })
+        );
+        assert!(pending.get(&key).is_none());
+
+        // --- Terminal wins: `PostToolUse` resolves the session before any
+        // HUD confirm reaches it.
+        let endpoint = receiver.config().endpoint.clone();
+        let losing_request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&endpoint)
+                .bearer_auth(token)
+                .json(&permission_request_body("session-2", "rmdir foo"))
+                .send()
+                .await
+                .unwrap()
+        });
+        let second_event = events.recv().await.unwrap();
+        consumer.ingest(&pending, &gate, &second_event);
+        let second_key = claude_key("launch-1", "session-2");
+        assert!(pending.get(&second_key).is_some());
+
+        // The terminal resolves it first -- this is what
+        // `ClaudeApprovalBodyConsumer` sees as a `PostToolUse` for that
+        // session once the approved tool actually runs.
+        consumer.ingest(
+            &pending,
+            &gate,
+            &ClaudeObserverEvent::Hook(ClaudeHookEvent {
+                launch_id: "launch-1".to_string(),
+                hook_event_name: "PostToolUse".to_string(),
+                session_id: Some("session-2".to_string()),
+                body: json!({}),
+            }),
+        );
+        assert!(pending.get(&second_key).is_none());
+
+        // The still-open hook connection degrades to 204 on its own --
+        // nobody ever dispatched a HUD confirm for it.
+        let losing_response = losing_request.await.unwrap();
+        assert_eq!(losing_response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        // A confirm attempt after the fact finds nothing left to answer.
+        let stale_selection = crate::hud_coordinator::HudApprovalSelection {
+            key: second_key,
+            decision_index: 0,
+        };
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &unused_broker,
+            &gate,
+            &stale_selection
+        )
+        .is_err());
+
+        // --- allow_with_permissions: a request whose hook body also carries
+        // `permission_suggestions` offers a third, middle decision; selecting
+        // it must carry that exact array back out as `updatedPermissions`,
+        // byte-for-byte, over the real HTTP round trip -- not a value
+        // reconstructed by the Host. This is the real KO3 `addRules`
+        // suggestion shape (`docs/claude-permission-hook-gate-results.md`
+        // §4), captured against a real Claude Code instance.
+        let suggestions = json!([{
+            "type": "addRules",
+            "behavior": "allow",
+            "destination": "localSettings",
+            "rules": [{"toolName": "PowerShell", "ruleContent": "New-Item -ItemType Directory ko3-test8"}]
+        }]);
+        let endpoint = receiver.config().endpoint.clone();
+        let suggestions_for_request = suggestions.clone();
+        let permissions_request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&endpoint)
+                .bearer_auth(token)
+                .json(&json!({
+                    "hook_event_name": "PermissionRequest",
+                    "session_id": "session-3",
+                    "cwd": "C:\\work",
+                    "tool_name": "PowerShell",
+                    "tool_input": {"command": "New-Item -ItemType Directory ko3-test8"},
+                    "permission_suggestions": suggestions_for_request
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+        let third_event = events.recv().await.unwrap();
+        consumer.ingest(&pending, &gate, &third_event);
+        let third_key = claude_key("launch-1", "session-3");
+
+        // Index 1 of `[allow, allow_with_permissions, deny]` -- the middle
+        // element `claude_approval_body` only adds because this request's
+        // `permission_suggestions` is non-empty.
+        let permissions_selection = crate::hud_coordinator::HudApprovalSelection {
+            key: third_key.clone(),
+            decision_index: 1,
+        };
+        assert!(super::dispatch_hud_response_selection(
+            &pending,
+            &unused_broker,
+            &gate,
+            &permissions_selection
+        )
+        .unwrap());
+
+        let permissions_response = permissions_request.await.unwrap();
+        assert_eq!(permissions_response.status(), reqwest::StatusCode::OK);
+        let permissions_body: Value = permissions_response.json().await.unwrap();
+        assert_eq!(
+            permissions_body,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow",
+                        "updatedPermissions": suggestions
+                    }
+                }
+            })
+        );
+        assert!(pending.get(&third_key).is_none());
+
+        receiver.shutdown().await.unwrap();
     }
 }

@@ -27,7 +27,8 @@ use std::{
 
 use rawhid_host_core::pending_approval::{
     ApprovalClient, ApprovalKey, PendingApprovalBody, PendingApprovalContent,
-    PendingApprovalSnapshot, PendingApprovalStore,
+    PendingApprovalSnapshot, PendingApprovalStore, CLAUDE_DECISION_ALLOW,
+    CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS, CLAUDE_DECISION_DENY,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -92,6 +93,19 @@ pub struct HudApprovalPayload {
     /// array). The value is an index only; the opaque decision itself remains
     /// in `PendingApprovalStore`.
     pub selected_decision_index: Option<usize>,
+    /// Display labels for `available_decisions`, same length and order,
+    /// **Claude Code entries only** -- `None` for Codex, whose frontend
+    /// fallback (`Hud.tsx`'s `decisionLabel`) is untouched by this field.
+    /// This exists because Claude Code's `allow_with_permissions` element
+    /// alone cannot tell the user what pressing it actually does: the same
+    /// visible request can offer a suggestion whose `destination` is
+    /// `"session"` (gone when the process exits) or `"localSettings"`
+    /// (written to disk, permanent until edited by hand) with no other
+    /// visual difference -- see `claude_allow_with_permissions_label`'s own
+    /// doc comment for the exact wording rules. Labels are plain English
+    /// regardless of the model-facing language, matching this HUD's
+    /// existing English-only decision list.
+    pub decision_labels: Option<Vec<String>>,
 }
 
 impl HudApprovalPayload {
@@ -113,6 +127,9 @@ impl HudApprovalPayload {
                 cwd: body.cwd.clone(),
                 available_decisions: body.available_decisions.clone(),
                 selected_decision_index,
+                decision_labels: (snapshot.client == ApprovalClient::ClaudeCode)
+                    .then(|| claude_decision_labels(body))
+                    .flatten(),
             },
             PendingApprovalContent::Oversized => Self {
                 request_key: key.token().to_string(),
@@ -125,8 +142,92 @@ impl HudApprovalPayload {
                 cwd: None,
                 available_decisions: None,
                 selected_decision_index: None,
+                decision_labels: None,
             },
         }
+    }
+}
+
+/// Builds the exact per-index labels for a Claude Code entry's
+/// `available_decisions` (see [`HudApprovalPayload::decision_labels`] for
+/// why this is Claude Code only). `None` when there is nothing to label
+/// (an absent or empty `available_decisions`), matching how the plain array
+/// itself is `None` in that case.
+fn claude_decision_labels(body: &PendingApprovalBody) -> Option<Vec<String>> {
+    let decisions = body.available_decisions.as_ref()?;
+    if decisions.is_empty() {
+        return None;
+    }
+    Some(
+        decisions
+            .iter()
+            .map(|decision| match decision.as_str() {
+                Some(CLAUDE_DECISION_ALLOW) => "allow".to_string(),
+                Some(CLAUDE_DECISION_DENY) => "deny".to_string(),
+                Some(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS) => {
+                    claude_allow_with_permissions_label(
+                        body.permission_suggestions.as_deref().unwrap_or(&[]),
+                    )
+                }
+                // Not expected for a Claude Code entry -- `claude_activity.rs`'s
+                // `claude_approval_body` only ever emits the three known
+                // strings above. Fall back to the raw JSON rather than
+                // guessing at a label for something this Host never sent.
+                _ => decision.to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// The label for the `allow_with_permissions` element, built purely from
+/// `permission_suggestions` -- see [`HudApprovalPayload::decision_labels`]'s
+/// doc comment for why the applied scope must always be visible here rather
+/// than left for the user to guess.
+///
+/// Priority, per the design this implements (`docs/` is not modified by this
+/// change, but the rule it captures is): a suggestion set is either entirely
+/// `"session"`-scoped, contains at least one `"localSettings"` entry (the
+/// disk-persisting case, called out first because it is the one that must
+/// never look identical to the session-only case), or contains some other,
+/// unrecognized destination value -- in which case that raw value is shown
+/// verbatim rather than silently mapped to an invented phrase. Separately, a
+/// `"setMode"` suggestion's `mode` is always appended when present, because
+/// changing the session's own permission mode is a side effect distinct
+/// from any single rule addition and must stay visible regardless of which
+/// scope case above applies.
+fn claude_allow_with_permissions_label(suggestions: &[Value]) -> String {
+    let destinations: Vec<&str> = suggestions
+        .iter()
+        .filter_map(|suggestion| suggestion.get("destination").and_then(Value::as_str))
+        .collect();
+    let scope = if destinations.is_empty() {
+        None
+    } else if destinations
+        .iter()
+        .all(|destination| *destination == "session")
+    {
+        Some("this session".to_string())
+    } else if destinations
+        .iter()
+        .any(|destination| *destination == "localSettings")
+    {
+        Some("saved to project settings".to_string())
+    } else {
+        // Unrecognized destination value(s) -- surface verbatim rather than
+        // inventing a phrase for something this Host has never observed.
+        Some(destinations.join(", "))
+    };
+    let mode = suggestions.iter().find_map(|suggestion| {
+        if suggestion.get("type").and_then(Value::as_str) != Some("setMode") {
+            return None;
+        }
+        suggestion.get("mode").and_then(Value::as_str)
+    });
+    match (scope, mode) {
+        (Some(scope), Some(mode)) => format!("allow + always ({scope}, mode: {mode})"),
+        (Some(scope), None) => format!("allow + always ({scope})"),
+        (None, Some(mode)) => format!("allow + always (mode: {mode})"),
+        (None, None) => "allow + always".to_string(),
     }
 }
 
@@ -348,9 +449,18 @@ pub(crate) fn response_selection_from_state(
 
 /// The reject side's decision index within the live `available_decisions`,
 /// per the priority order in `docs/ai-approval-hud-design.md`: an exact
-/// `"decline"` element wins, otherwise an exact `"cancel"` element, otherwise
-/// there is no reject-side target at all. Elements are not necessarily
-/// strings, so this only ever matches via `as_str()`.
+/// `"decline"` element wins, then an exact `"cancel"` element, then an exact
+/// `"deny"` element, otherwise there is no reject-side target at all.
+/// Elements are not necessarily strings, so this only ever matches via
+/// `as_str()`.
+///
+/// `"deny"` is last and Codex-safe to add: stage 2's real-CLI capture
+/// (`docs/codex-approval-proxy-gate-results.md` §5.1) never offered
+/// `"deny"` alongside `"decline"`/`"cancel"`, so this addition cannot change
+/// any existing Codex outcome -- it only gives Claude Code's Host-normalized
+/// `[CLAUDE_DECISION_ALLOW, CLAUDE_DECISION_DENY]` (`pending_approval.rs`)
+/// a reject-side target, since Claude Code has no `"cancel"`/`"decline"` of
+/// its own.
 fn reject_decision_index_from_body(body: &PendingApprovalBody) -> Option<usize> {
     let decisions = body.available_decisions.as_ref()?;
     decisions
@@ -360,6 +470,11 @@ fn reject_decision_index_from_body(body: &PendingApprovalBody) -> Option<usize> 
             decisions
                 .iter()
                 .position(|decision| decision.as_str() == Some("cancel"))
+        })
+        .or_else(|| {
+            decisions
+                .iter()
+                .position(|decision| decision.as_str() == Some("deny"))
         })
 }
 
@@ -646,8 +761,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        begin_response_from_state, current_target, replace_shown, response_selection_from_state,
-        ApprovalKey, HudInteractionState, HudSelectionDirection, Instant, HUD_CONFIRM_GUARD,
+        begin_response_from_state, claude_allow_with_permissions_label, claude_decision_labels,
+        current_target, reject_decision_index_from_body, replace_shown,
+        response_selection_from_state, ApprovalKey, HudInteractionState, HudSelectionDirection,
+        Instant, HUD_CONFIRM_GUARD,
     };
 
     fn body(decisions: Vec<Value>) -> PendingApprovalBody {
@@ -660,6 +777,7 @@ mod tests {
             available_decisions: Some(decisions),
             tool_use_id: None,
             prompt_id: None,
+            permission_suggestions: None,
         }
     }
 
@@ -865,6 +983,52 @@ mod tests {
         assert_eq!(state.selected_decision_index(2), Some(1));
     }
 
+    /// Claude Code's Host-normalized array has neither `"decline"` nor
+    /// `"cancel"` -- `"deny"` is the only reject-side option it ever offers,
+    /// which is exactly the case the third priority tier exists for.
+    #[test]
+    fn reject_falls_back_to_deny_for_claude_codes_allow_deny_array() {
+        let store = PendingApprovalStore::new();
+        let key = codex_key("connection-a", &json!(1)); // key shape is irrelevant to this pure function
+        store.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            body(vec![json!("allow"), json!("deny")]),
+        );
+        let shown_at = Instant::now();
+        let mut state = HudInteractionState::default();
+        state.sync_target(Some(&key), 2, shown_at);
+
+        let snapshot = store.get(&key).unwrap();
+        assert_eq!(state.move_selection_toward_reject(&snapshot), Some(1));
+    }
+
+    /// Regression: adding `"deny"` as a third priority tier must not change
+    /// which index a Codex array with `"cancel"` already present resolves
+    /// to -- `"cancel"` still wins over `"deny"` when both are present, even
+    /// though real Codex captures never actually offer both together
+    /// (`docs/codex-approval-proxy-gate-results.md` §5.1).
+    #[test]
+    fn reject_still_prefers_cancel_over_deny_when_a_codex_array_somehow_has_both() {
+        let store = PendingApprovalStore::new();
+        let key = insert_codex(
+            &store,
+            "connection-a",
+            13,
+            vec![json!("approve"), json!("cancel"), json!("deny")],
+        );
+        let shown_at = Instant::now();
+        let mut state = HudInteractionState::default();
+        state.sync_target(Some(&key), 3, shown_at);
+
+        let snapshot = store.get(&key).unwrap();
+        assert_eq!(state.move_selection_toward_reject(&snapshot), Some(1));
+    }
+
     #[test]
     fn reject_move_has_no_confirm_guard_delay() {
         let store = PendingApprovalStore::new();
@@ -1030,5 +1194,119 @@ mod tests {
         // transition has no stale flag left to preserve.
         store.resolve(&newest);
         assert!(current_target(&store, shown.clone()).is_none());
+    }
+
+    /// `reject_decision_index_from_body`'s exact-match `"deny"` lookup must
+    /// keep returning the last index once Claude Code's array grows a third,
+    /// middle `allow_with_permissions` element -- this is what makes the
+    /// design's "`deny` always last" placement rule actually matter, not
+    /// just a cosmetic choice.
+    #[test]
+    fn reject_index_still_finds_deny_last_in_the_three_element_claude_array() {
+        let three_element = body(vec![
+            json!("allow"),
+            json!("allow_with_permissions"),
+            json!("deny"),
+        ]);
+        assert_eq!(reject_decision_index_from_body(&three_element), Some(2));
+    }
+
+    /// Pattern 1 of 4 from the design's required label test: every
+    /// suggestion in the set is `"session"`-scoped.
+    #[test]
+    fn allow_with_permissions_label_for_all_session_scoped_suggestions() {
+        let suggestions = vec![
+            json!({"type": "addRules", "destination": "session", "rules": []}),
+            json!({"type": "addRules", "destination": "session", "rules": []}),
+        ];
+        assert_eq!(
+            claude_allow_with_permissions_label(&suggestions),
+            "allow + always (this session)"
+        );
+    }
+
+    /// Pattern 2 of 4: at least one `"localSettings"` entry, mixed with a
+    /// `"session"` entry -- `localSettings` must win the label even though
+    /// it is not every entry, since disk persistence is the safety-relevant
+    /// fact the user needs to see.
+    #[test]
+    fn allow_with_permissions_label_prefers_local_settings_when_mixed_with_session() {
+        let suggestions = vec![
+            json!({"type": "addRules", "destination": "session", "rules": []}),
+            json!({"type": "addRules", "destination": "localSettings", "rules": []}),
+        ];
+        assert_eq!(
+            claude_allow_with_permissions_label(&suggestions),
+            "allow + always (saved to project settings)"
+        );
+    }
+
+    /// Pattern 3 of 4: an unrecognized `destination` value is surfaced
+    /// verbatim, never silently mapped to "this session" or any other
+    /// invented phrase.
+    #[test]
+    fn allow_with_permissions_label_surfaces_an_unknown_destination_verbatim() {
+        let suggestions = vec![json!({
+            "type": "addRules",
+            "destination": "someFutureDestination",
+            "rules": []
+        })];
+        assert_eq!(
+            claude_allow_with_permissions_label(&suggestions),
+            "allow + always (someFutureDestination)"
+        );
+    }
+
+    /// Pattern 4 of 4: a `setMode` suggestion's `mode` is appended alongside
+    /// the scope derived from the other entries in the same set -- the real
+    /// two-entry `setMode` + `addDirectories` capture from the design.
+    #[test]
+    fn allow_with_permissions_label_appends_set_mode_alongside_the_scope() {
+        let suggestions = vec![
+            json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"}),
+            json!({"type": "addDirectories", "directories": ["C:\\temp"], "destination": "session"}),
+        ];
+        assert_eq!(
+            claude_allow_with_permissions_label(&suggestions),
+            "allow + always (this session, mode: acceptEdits)"
+        );
+    }
+
+    /// End-to-end through `claude_decision_labels`: the three-element array
+    /// gets `["allow", <computed allow_with_permissions label>, "deny"]`,
+    /// same length and order as `available_decisions` itself.
+    #[test]
+    fn claude_decision_labels_covers_all_three_elements_in_order() {
+        let suggestions = vec![json!({
+            "type": "addRules",
+            "destination": "localSettings",
+            "rules": []
+        })];
+        let mut with_suggestions = body(vec![
+            json!("allow"),
+            json!("allow_with_permissions"),
+            json!("deny"),
+        ]);
+        with_suggestions.permission_suggestions = Some(suggestions);
+
+        assert_eq!(
+            claude_decision_labels(&with_suggestions),
+            Some(vec![
+                "allow".to_string(),
+                "allow + always (saved to project settings)".to_string(),
+                "deny".to_string(),
+            ])
+        );
+    }
+
+    /// An absent or empty `available_decisions` has nothing to label.
+    #[test]
+    fn claude_decision_labels_is_none_without_available_decisions() {
+        let mut no_decisions = body(vec![]);
+        no_decisions.available_decisions = None;
+        assert_eq!(claude_decision_labels(&no_decisions), None);
+
+        let empty_decisions = body(vec![]);
+        assert_eq!(claude_decision_labels(&empty_decisions), None);
     }
 }

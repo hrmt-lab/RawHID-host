@@ -20,7 +20,8 @@ use rawhid_host_core::{
 };
 
 use rawhid_host_core::{
-    ClaudeObserverCounters, ClaudeObserverEvents, ClaudeObserverReceiver, ClaudeSessionRegistry,
+    ClaudeObserverCounters, ClaudeObserverEvents, ClaudeObserverReceiver, ClaudePermissionGate,
+    ClaudeSessionRegistry,
 };
 
 use crate::debug_log::DebugLogHandle;
@@ -80,6 +81,16 @@ pub struct AppState {
     pub ai_usage_runtime: Arc<Mutex<Option<AiUsageRuntime>>>,
     pub codex_activity: Arc<CodexActivityRuntime>,
     pub claude_integration: Arc<Mutex<Option<ClaudeIntegration>>>,
+    /// Shared between every Claude Code launch's `ClaudeObserverReceiver`
+    /// (`commands.rs`'s `launch_claude_code`, which passes a clone into
+    /// `ClaudeObserverReceiverOptions`) and the Tauri command / physical
+    /// HUD-action paths that answer a `PermissionRequest` hook
+    /// (`respond_to_claude_approval_internal`, `actions.rs`'s
+    /// `dispatch_hud_response_selection`). One instance for the whole
+    /// process, not one per launch, exactly like `codex_activity`'s single
+    /// `PendingApprovalStore` -- see that field's own reasoning for sharing
+    /// one store/gate rather than scoping it per launch.
+    pub claude_permission_gate: Arc<ClaudePermissionGate>,
     pub ai_display_slots: Arc<Mutex<AiDisplaySlots>>,
     pub codex_broker: CodexBrokerManager,
     pub key_stats: SharedKeyStatsStore,
@@ -513,6 +524,7 @@ impl AppState {
             ai_usage_runtime: Arc::new(Mutex::new(ai_usage_runtime)),
             codex_activity,
             claude_integration: Arc::new(Mutex::new(None)),
+            claude_permission_gate: Arc::new(ClaudePermissionGate::default()),
             ai_display_slots: Arc::new(Mutex::new(AiDisplaySlots::new(display_slot_count))),
             codex_broker,
             key_stats,

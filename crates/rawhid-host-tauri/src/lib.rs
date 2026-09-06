@@ -63,6 +63,7 @@ pub fn run() {
             commands::get_log_entries,
             commands::get_codex_integration_status,
             commands::respond_to_codex_approval,
+            commands::respond_to_claude_approval,
             commands::get_ai_client_state,
             commands::get_ai_display_slots,
             commands::pin_ai_display_slot,

@@ -17,6 +17,7 @@ use rawhid_host_core::{
     active_app::SystemActiveAppProvider,
     ai_usage::{AiUsageRefreshError, AiUsageRuntime, AiUsageShared},
     claude_activity::{ClaudeApprovalBodyConsumer, ClaudeSessionSnapshot, ClaudeStateChange},
+    claude_decision::ClaudePermissionGate,
     claude_hooks::{write_claude_observer_plugin, ClaudePluginOptions},
     claude_observer::{ClaudeObserverReceiver, ClaudeObserverReceiverOptions},
     codex_activity::{
@@ -78,6 +79,9 @@ pub struct MonitorExtras {
     pub codex_activity: Arc<CodexActivityRuntime>,
     pub codex_broker: CodexBrokerManager,
     pub claude_integration: Arc<Mutex<Option<ClaudeIntegration>>>,
+    /// Cloned from `AppState::claude_permission_gate` -- see that field's
+    /// doc comment for why it is one process-wide instance.
+    pub claude_permission_gate: Arc<ClaudePermissionGate>,
     pub ai_display_slots: Arc<Mutex<AiDisplaySelection>>,
     pub hud: Arc<Mutex<Option<HudCoordinator>>>,
     /// The ScreenKey slot that most recently dispatched a HUD answer, and
@@ -558,6 +562,79 @@ pub(crate) fn respond_to_codex_approval_internal(
     }
 }
 
+/// Answers the exact Claude Code `PermissionRequest` currently represented
+/// by `request_key`, the Claude Code counterpart to
+/// `respond_to_codex_approval`. `decision_index` is resolved against the
+/// Host-normalized `available_decisions` array -- `[CLAUDE_DECISION_ALLOW,
+/// CLAUDE_DECISION_DENY]`, or, when the request also offered a
+/// "remember this choice" option, the three-element `[CLAUDE_DECISION_ALLOW,
+/// CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS, CLAUDE_DECISION_DENY]` (see
+/// `claude_activity.rs`'s `claude_approval_body`); the frontend cannot
+/// fabricate a decision, exactly as with Codex.
+#[tauri::command]
+pub fn respond_to_claude_approval(
+    request_key: String,
+    decision_index: usize,
+    state: State<AppState>,
+) -> Result<bool, String> {
+    let pending = state.codex_activity.pending_approvals();
+    respond_to_claude_approval_internal(
+        &pending,
+        &state.claude_permission_gate,
+        &request_key,
+        decision_index,
+    )
+}
+
+/// Shared by the Tauri command and physical HUD actions, mirroring
+/// `respond_to_codex_approval_internal`'s shape. Unlike Codex's Broker
+/// round trip, `ClaudePermissionGate::answer` is synchronous -- there is no
+/// App Server to await -- but the lookup-then-answer order is exactly the
+/// same "check the live state immediately before answering" discipline: by
+/// the time this runs, `ClaudeApprovalBodyConsumer` may have already
+/// canceled the gate waiter because the terminal answered first (§9.4's
+/// first-wins rule), in which case `answer` below simply returns `false`
+/// the same way Codex's `AlreadyResolved` does.
+pub(crate) fn respond_to_claude_approval_internal(
+    pending: &PendingApprovalStore,
+    gate: &ClaudePermissionGate,
+    request_key: &str,
+    decision_index: usize,
+) -> Result<bool, String> {
+    let response = pending
+        .claude_response(request_key, decision_index)
+        .ok_or_else(|| "The approval is no longer available".to_string())?;
+    // `diagnostic_label()`, not `behavior()`: the wire `behavior` string
+    // collapses `Allow` and `AllowWithPermissions` to the same `"allow"`
+    // (that collapse is what the real hook protocol expects -- see
+    // `ClaudeDecision::behavior`'s own doc comment), which would make this
+    // log unable to tell a plain allow from an allow-that-writes-permanent-
+    // rules-to-disk. The diagnostic label keeps that distinction without
+    // exposing anything about *what* rules were written.
+    let behavior = response.decision.diagnostic_label();
+    let answered = gate.answer(response.key.token(), response.decision);
+    // Diagnostics only, at the same target/level as the other AI display
+    // logging (`AI_DISPLAY_LOG_TARGET`) so a real-HID run that presses the
+    // HUD button and sees nothing happen can be traced without turning on
+    // full tracing. Deliberately just these three fields -- `behavior`,
+    // `answered`, `waiting` -- and nothing else: no token, request key,
+    // launch/session id, command text, tool name, hook body content, or
+    // `updatedPermissions` contents (which, for an `AllowWithPermissions`
+    // decision, can itself carry a full command string via `ruleContent`).
+    // Those identify *what* was asked and *who* asked it, which this log
+    // has no reason to know; `behavior`/`answered`/`waiting` are enough to
+    // tell whether the press reached a waiting hook connection at all.
+    tracing::debug!(
+        target: AI_DISPLAY_LOG_TARGET,
+        behavior,
+        answered,
+        waiting = gate.waiting_count(),
+        "claude approval decision dispatched"
+    );
+    pending.resolve(&response.key);
+    Ok(answered)
+}
+
 #[tauri::command]
 pub fn get_ai_client_state(state: State<AppState>) -> AiClientStateSnapshot {
     state
@@ -781,12 +858,17 @@ pub async fn launch_claude_code(
         .ok_or_else(|| "Claude Code project directory is required".to_string())?;
     let display_name = terminal_display_name("Claude Code", project_for_title, &terminal_target_id);
     let launch_id = format!("launch-{}", &terminal_target_id[7..]);
-    let (receiver, events) = ClaudeObserverReceiver::bind(ClaudeObserverReceiverOptions::loopback(
-        launch_id,
-        hex::encode(token),
-    ))
-    .await
-    .map_err(|error| error.to_string())?;
+    // Share the process-wide gate rather than `loopback`'s own fresh one:
+    // a physical HUD answer (routed through `AppState::claude_permission_gate`
+    // via `MonitorExtras`) must reach the exact hook connection this launch's
+    // receiver holds open, and vice versa for
+    // `ClaudeApprovalBodyConsumer`'s first-wins cancellation.
+    let mut observer_options =
+        ClaudeObserverReceiverOptions::loopback(launch_id, hex::encode(token));
+    observer_options.permission_gate = Arc::clone(&state.claude_permission_gate);
+    let (receiver, events) = ClaudeObserverReceiver::bind(observer_options)
+        .await
+        .map_err(|error| error.to_string())?;
     let plugin_root = claude_plugin_root(receiver.config().launch_id.as_str())?;
     let helper_executable = claude_helper_executable()?;
     let options = ClaudePluginOptions {
@@ -4240,6 +4322,7 @@ pub fn start_host_link_worker(
         codex_activity: Arc::clone(&state.codex_activity),
         codex_broker: state.codex_broker.clone(),
         claude_integration: Arc::clone(&state.claude_integration),
+        claude_permission_gate: Arc::clone(&state.claude_permission_gate),
         ai_display_slots: Arc::clone(&state.ai_display_slots),
         hud: Arc::clone(&state.hud),
         hud_responded: Arc::new(Mutex::new(None)),
@@ -4546,6 +4629,7 @@ fn claude_as_ai_snapshot(snapshot: Option<ClaudeSessionSnapshot>) -> AiClientSta
 fn drain_claude_state_changes(
     integration: &Arc<Mutex<Option<ClaudeIntegration>>>,
     pending_approvals: &PendingApprovalStore,
+    permission_gate: &ClaudePermissionGate,
     now: Instant,
 ) -> (
     Vec<ClaudeSessionSnapshot>,
@@ -4564,7 +4648,7 @@ fn drain_claude_state_changes(
     let approval_consumer = ClaudeApprovalBodyConsumer;
     for launch in integration.launches.values_mut() {
         while let Ok(event) = launch.events.try_recv() {
-            approval_consumer.ingest(pending_approvals, &event);
+            approval_consumer.ingest(pending_approvals, permission_gate, &event);
             if let Ok(mut changes) = integration.registry.apply(event, now) {
                 claude_changes.append(&mut changes);
             }
@@ -5766,6 +5850,7 @@ fn run_monitor_loop(
             drain_claude_state_changes(
                 &extras.claude_integration,
                 &extras.codex_activity.pending_approvals(),
+                &extras.claude_permission_gate,
                 now,
             );
         // The HUD's current Codex target, read before the `ai_display_slots`

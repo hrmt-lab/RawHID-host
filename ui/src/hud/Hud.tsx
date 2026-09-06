@@ -149,7 +149,7 @@ export default function Hud() {
                 className={`rounded px-1 py-0.5 text-xs ${shown.selected_decision_index === index ? "bg-accent/20 text-accent-deep" : "text-ink"}`}
               >
                 {shown.selected_decision_index === index && <span aria-hidden="true">› </span>}
-                {decisionLabel(decision)}
+                {shown.decision_labels?.[index] ?? decisionLabel(decision)}
               </li>
             ))}
           </ul>

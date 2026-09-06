@@ -242,6 +242,12 @@ export interface HudApprovalPayload {
   /** Host-managed cursor into `available_decisions`; null when no decision
    * can safely be selected. */
   selected_decision_index: number | null;
+  /** Same length/order as `available_decisions`, Claude Code entries only
+   * (rawhid-host-tauri's `HudApprovalPayload::decision_labels`). `null` for
+   * a Codex entry -- fall back to `decisionLabel()` below for those, same as
+   * before this field existed. Always English, matching this HUD's existing
+   * English-only decision list (no i18n). */
+  decision_labels: string[] | null;
 }
 
 export type HostActionKind =
