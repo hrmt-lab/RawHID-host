@@ -1,8 +1,8 @@
 # ScreenKey と HUD による AI 承認・回答 設計
 
-- 状態: **段階1・段階2、および段階4の一部（ScreenKeyの9バイト拡張と対象表示・確定演出、§8）まで実装・実機受け入れ済み（2026-09-06）。** 次は段階3（Claude Codeのdecision経路）
+- 状態: **段階1・段階2・段階3、および段階4の一部（ScreenKeyの9バイト拡張と対象表示・確定演出、§8）まで実装・実機受け入れ済み（2026-09-06）。** 次は段階4の残り（ScreenKeyのClaude Code対象表示）
 - 作成日: 2026-09-03
-- 最終更新: 2026-09-06（段階4の一部を実HIDで受け入れたことにともない §8・§11・§13・§14 を実装に合わせて改訂。§8 は対象表示の前提を実機の誤読を受けて逆転させた）
+- 最終更新: 2026-09-06（段階3を実HIDで受け入れたことにともない §7.2・§9.2・§9.3・§12・§13・§14 を改訂。**§9.3 は「Claude Codeに『常に許可』を提供しない」判断を実測にもとづき撤回した**）
 - 対象: Keylink Studio Host、Codex Broker、Claude Code Observer、Tauri UI、Firmware 描画
 - 対象ハードウェア: ScreenKey 4個（0.85インチ / 128×128 / ST7735S）、通常キー、エンコーダ 1個（**押しボタン無し**）。実機は aipad（3×4、うち ScreenKey 4・`&bootloader` 1・エンコーダ位置 1）
 - 基準環境: `codex-cli 0.153.2`、Claude Code `2.1.259`、Windows 11 Pro `10.0.26200.9278`
@@ -296,7 +296,7 @@ HUD にフォーカスを渡す理由が構造的に存在しない。
 | 理由 | `reason`（**AI がユーザーの言語で書く**。実測は日本語） | — |
 | 作業ディレクトリ | `cwd` | `cwd` |
 | ツール種別 | `kind` | `tool_name` |
-| 選択肢 | `availableDecisions`（**要求ごとに読む**） | Host 側で `許可 / 拒否` を正規化 |
+| 選択肢 | `availableDecisions`（**要求ごとに読む**） | Host 側で `allow` / `allow_with_permissions` / `deny` を正規化（§9.2・§9.3） |
 
 **Codex の `command` をそのまま主表示にしてはならない。** `powershell.exe -Command '...'` の
 ラッパに本質が埋もれる。
@@ -514,7 +514,9 @@ guard 後の decision、Host先行／CLI先行のfirst-wins、`decline` と `can
 
 ### 9.2 Claude Code（hook decision）
 
-**`claude_observer.rs:323` の 204 応答を、`PermissionRequest` に限り decision へ差し替える。**
+**実装済み・実機受け入れ済み（2026-09-06）。** `claude_observer.rs` は `PermissionRequest` に
+限り 204 の代わりに decision を返す。**他の hook はすべて 204 のまま維持**し、観測専用の隔離を
+保っている。
 
 ```json
 {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
@@ -523,24 +525,75 @@ guard 後の decision、Host先行／CLI先行のfirst-wins、`decline` と `can
 
 ```json
 {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
-  "decision":{"behavior":"deny","message":"<理由>"}}}
+  "decision":{"behavior":"deny","message":"ユーザがこの操作を拒否しました。"}}}
 ```
 
-- **拒否には理由を添える。** KO-3 で `message` がモデルに届くことを確認済み。
-  ターミナルにも `Denied by PermissionRequest hook` と明示される
-- hook の `timeout` を `CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS = 1` から延長する。
-  KO-3 の Q6 のとおり、延長してもユーザーが固まるリスクはない
-- **他の hook は 204 のまま維持する**
-- Studio が回答を持たない場合は必ず 204 へ縮退させ、ターミナルに委ねる
+- **hook 接続を開いたまま待つ。** `ClaudePermissionGate` が、待っている hook 接続と Host 側の
+  回答を token（`claude_key` の不透明値）で突き合わせる。要求1件につき待ち口は1つで、
+  **答えは1回しか通らない**
+- **hook の `timeout` は `PermissionRequest` だけ 60 秒**（他は据え置きの1秒）。Host 側は 55 秒で
+  自分から 204 へ降りる。Claude Code に打ち切られる前に Host が閉じるため
+- **拒否には理由を添える。** 文面は事実のみの1文で、**行動指示は入れない**。❌ の押下には
+  「拒否した」以上の情報が無く、毎回同じ指示を注入するとモデルの判断を奪うため。実機では、
+  指示を書かなくてもモデルは再試行せず代替案を出して指示を仰いだ
+- **Studio が回答を持たない場合は必ず 204 へ縮退させ、ターミナルに委ねる**
+- 診断ログを1行だけ出す（`behavior` / `answered` / `waiting`）。**要求内容・token・識別子は出さない**
+
+実機で確認した経路（ファイルログの実測値）:
+
+```text
+07:45:58  承認待ちに入る
+07:46:09  claude approval decision dispatched behavior="allow" answered=true waiting=0
+07:46:09  作業中に戻る   ← 決定の 0.38 秒後
+```
 
 ### 9.3 「常に許可」
 
-| クライアント | 提供 | 理由 |
-|---|---|---|
-| **Claude Code** | **しない** | `ruleContent` が完全一致の文字列で、Claude は毎回違うコマンドを生成するため実効性が乏しい。かつ `destination: "localSettings"` で恒久権限になる。ターミナルの選択肢のほうが広いルール（`New-Item *`）を作る |
-| **Codex** | 検討可 | `proposedExecpolicyAmendment` はプログラム単位（`mkdir`）で実効性がある |
+**2026-09-06、「Claude Code では提供しない」という判断を撤回した。実装済み。**
 
-Codex で提供する場合も **`Fn` 併用必須**とし、単押しでは出さない。
+撤回の理由は、見送りの根拠だった2点が実測で否定されたことにある。当時の根拠は 2026-08-08 の
+たった1件の観測にもとづいていた。
+
+| 見送り時の根拠 | 2026-09-06 の実測 |
+|---|---|
+| `ruleContent` が完全一致の文字列で実効性が乏しい | `//c/temp/**` のような**ワイルドカード**や、フォルダ単位の `addDirectories` が来る |
+| `destination: "localSettings"` で恒久権限になる | `destination: "session"`（セッション限定）が来る |
+
+ただし **`localSettings`（恒久）も現役で存在する。** ほぼ同じ「C:\temp を見るだけ」の
+コマンドで、一方は `session`、他方は `localSettings` だった。実際に返したところ、
+プロジェクトの `.claude/settings.local.json` が作成されルールが書き込まれた。
+**ユーザーは要求の見た目から区別できない。**
+
+#### 実装
+
+- hook body の `permission_suggestions` を `PendingApprovalBody` に**不透明値のまま**保持する。
+  観測された種類は `addRules` / `setMode` / `addDirectories` の3通りで、件数も宛先も要求ごとに
+  変わる。**Codex の `availableDecisions` と同じく、中身を作り変えてはならない**
+- 候補が非空のときだけ `available_decisions` を `[allow, allow_with_permissions, deny]` の
+  3要素にする。**`allow` は必ず index 0**（既定選択が「常に許可」になってはならない）、
+  **`deny` は必ず末尾**（§6.2 の拒否側探索が完全一致 `"deny"` を探すため）
+- 選ばれたら `{"behavior":"allow","updatedPermissions":[<候補をそのまま>]}` を返す。
+  **キー名 `updatedPermissions` は実測で確定した値**（KO-3 の Q5 は当時 ⏸ のままだった）
+- **候補を1件ずつ選ばせない。** ターミナルも複数候補を1つの選択肢としてまとめて適用しており、
+  片方だけ適用しても残ったもう一方の条件で次も聞かれる
+
+#### ラベルは必ず適用範囲を出す
+
+**安全上の要件であって親切心ではない。** キー1つで恒久的な権限が付く経路が実在するため。
+
+| 候補の `destination` | HUD のラベル |
+|---|---|
+| すべて `session` | `allow + always (this session)` |
+| `localSettings` を含む | `allow + always (saved to project settings)` |
+| 未知の値 | 生の値をそのまま並べる（**言い換えない**） |
+
+`type: "setMode"` を含むときは `mode: acceptEdits` のように付記する。セッションの承認モード
+そのものが変わる副作用は、押す前にユーザーへ伝わるべきため。
+
+#### Codex
+
+`proposedExecpolicyAmendment` はプログラム単位（`mkdir`）で実効性があり、提供は検討可。未実装。
+Codex の decision は不透明値をそのまま返す契約なので、**理由やフィールドを添える余地は無い**。
 
 ### 9.4 二重回答の調停
 
@@ -641,7 +694,7 @@ ScreenKey を押しても白い L 字が最大 5 秒動かず、§8 の目的を
 | 既定 | **無効。** Settings から明示的な警告つき opt-in |
 | 権限 | 既存 host action の制約を継承（device 単位の許可リスト、監視中のみ、同一 `seq` は1回） |
 | 誤爆防止 | HUD 出現直後 400ms は ✅ を受け付けない（**実装済み・実機確認済み**）。❌ には掛からない（送信しないため） |
-| 「常に許可」 | 未実装。導入するなら単押しでは出さない |
+| 「常に許可」 | **Claude Code は実装済み**（§9.3）。単押しの3つ目の選択肢として出すが、**適用範囲を必ずラベルに出す**（`this session` / `saved to project settings`）。Codex は未実装 |
 | 中断 | **❌ → ✅ の 2 打鍵**（`cancel` を明示的に選んで送る）。長押しは使わない（§6.5） |
 | 縮退 | 失敗時は必ずターミナルへ委ねる。**自動許可へ倒さない** |
 | 監査ログ | セッション、要求種別、押下、送出可否、失敗理由を記録 |
@@ -700,9 +753,32 @@ ScreenKey が「対象を選ぶキーなのにフィードバックを返さな�
 2. **Host が値 3 を 1 回でなく 850ms 保持する。** 1 回だと直後の状態変化で演出が消える
 3. **確定演出を外周のリングから中央のバッジへ。** 外周はキーキャップの縁で見切れる
 
-### 次は段階3
+### 段階3：完了（2026-09-06）
 
-Claude Code の decision 経路と first-wins 調停へ進む。
+Claude Code の decision 経路と first-wins 調停を実装し、実HID で受け入れた。あわせて §9.3 の
+「常に許可」も実装している（当初は対象外だったが、見送り判断の撤回にともない前倒しした）。
+
+確認した項目：
+
+- HUD に Claude Code の要求が出て、許可／拒否がキーボードから通る（ログの `answered=true` で裏取り）
+- **セッション限定と恒久がラベルで区別できる**
+- 「常に許可」が実際に効き、同じ操作で二度目は聞かれない
+- 恒久を選ぶとプロジェクトに `.claude/settings.local.json` が作られる
+- 候補が無い要求では従来どおり2択のまま
+- 400 ms guard が効き、ターミナル先着時に二重実行されない
+- 拒否理由がモデルへ届き、モデルは再試行せず指示を仰ぐ
+- 他の hook の観測（セッション状態表示）が壊れていない
+
+first-wins は、ターミナルが先に答えると `PostToolUse` / `PermissionDenied` が届き、
+`ClaudeApprovalBodyConsumer` が待ち口を取り下げる形で成立している。**待ち口が1つしか無いため、
+構造上二重に答えられない。**
+
+### 次は段階4の残り
+
+**ScreenKey の Claude Code 対象表示。** 現在 `target_codex_thread()` が Codex しか返さないため、
+HUD 対象が Claude Code のときは全スロットが「対象でない」表示（値2）のままになる。段階3 の
+範囲外として意図的に外してある。着手時は「表示候補と状態変化は同じ述語で絞る」（§8、
+2026-09-04 の再発防止）を壊さないこと。
 
 ---
 
@@ -711,7 +787,8 @@ Claude Code の decision 経路と first-wins 調停へ進む。
 1. **本番フル構成での HUD 再測定。** KO-1 のプローブは最小の `tauri::Builder` であり、
    トレイ・多数のコマンド・監視スレッドを持つ本番構成ではない
 2. **HUD のモニタ選択。** 現在の実装はプライマリモニタ右下固定
-3. Claude Code の hook `timeout` の上限値
+3. ~~Claude Code の hook `timeout` の上限値~~ **→ 2026-09-06 決着。** `PermissionRequest`
+   だけ 60 秒（Host 側の待ちは 55 秒）を採用した。上限そのものは未調査だが実用上足りている
 4. `item/fileChange/requestApproval` / `item/permissions/requestApproval` /
    `item/tool/requestUserInput` の各要求の扱い（本書は command approval を初期対象とする）
 5. Codex の `proposedExecpolicyAmendment` を適用したときの永続範囲
@@ -727,6 +804,16 @@ Claude Code の decision 経路と first-wins 調停へ進む。
    試せる機体が存在しないため
 10. **対象切替の即時送信は新旧 2 スロットへ連続して HID を書く**（§11）。理屈上は 2 枚が
     同時に対象に見える数ミリ秒の隙間がある。実機では視認されなかった
+11. **`setMode` を含む候補を HUD から適用したときの挙動。** ラベルには出るが、実機で選んで
+    セッションが `acceptEdits` に切り替わるところまでは確認していない
+12. **`session` 宛の候補が適用されたことの直接確認。** `localSettings` はファイルが残るので
+    確認できたが、`session` は残らない。次の要求で候補の顔ぶれが変わったことからの間接的な
+    確認にとどまる
+13. **ScreenKey の Claude Code 対象表示が未実装**（§13「次は段階4の残り」）
+14. **`AskUserQuestion` のような「答えを聞くツール」。** HUD には出るが、allow/deny が決めるのは
+    「そのツールを実行してよいか」だけで、質問への回答は決まらない。ユーザー判断で**除外せず
+    出し続ける**こととし、将来 HUD から質問そのものに答えられるようにしたい（`Elicitation`
+    hook を扱う別機能になる）
 
 ---
 
