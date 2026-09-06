@@ -289,3 +289,45 @@ Q5 の最初の試行は**検証になっていなかった**。
 | # | 内容 | 落ちた場合 |
 |---|---|---|
 | KO-2 | Codex へ代理 response を送ったとき TUI のプロンプトが正しく閉じるか | Broker が要求を保持して CLI へ転送しない方式へ切り替える |
+
+---
+
+## 11. 追記（2026-09-07 実機）— ターミナルが先に答えたときの hook
+
+段階4 の実機確認で、**first-wins のターミナル側について当初の前提が違っていた**ことが分かった。
+
+**ターミナルで拒否しても、Studio が待ち受けている hook は 1 つも届かない。** 拒否後 6 分間、
+`PermissionDenied` も `PostToolUse` も `Stop` も来なかった。`PermissionDenied` は plugin に
+登録済みだが、診断ログを入れて以降**一度も観測されていない**。
+
+代わりに **hook 接続が閉じる**。これは対照実験で確認した。
+
+| ターミナルでの操作 | `PermissionRequest` の hook 接続 | そのあと届く hook |
+|---|---|---|
+| **拒否** | **要求の 10.7 秒後に閉じた**（＝押した瞬間） | 無し |
+| **許可** | 開いたまま | 道具の完了後に `Stop` / `PostToolUse` / `PostToolBatch` |
+| **放置**（何も触らない） | **3 分半後も開いたまま** | `Notification` のみ |
+
+放置した要求の接続が開いたままであることが、「10 秒ほどで勝手に閉じる作り」ではないことの
+裏付けになっている。**接続の切断は「ターミナルで拒否された」合図として使える**（設計は
+`docs/ai-approval-hud-design.md` §9.5）。
+
+### 観測された hook の顔ぶれ
+
+診断ログ（`claude hook observed`）で数えた実測。**`PermissionDenied` はゼロ**、
+`PostToolUse` より `PostToolBatch` の方が多い。
+
+| hook | 回数 |
+|---|---|
+| Notification | 10 |
+| UserPromptSubmit / PreToolUse | 9 / 9 |
+| PermissionRequest | 8 |
+| Stop / SessionEnd / PostToolBatch | 2 / 2 / 2 |
+| PostToolUse | 1 |
+| **PermissionDenied** | **0** |
+
+### §Q6 の再確認
+
+hook の `timeout` を延ばして安全という §Q6 の結論にもとづき、2026-09-07 に
+`PermissionRequest` の `timeout` を 60 秒 → 600 秒、Host 側の待ちを 55 秒 → 595 秒へ延ばした。
+**Claude Code 側の上限は依然として未実測**である。
