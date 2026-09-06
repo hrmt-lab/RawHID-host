@@ -45,6 +45,42 @@ struct RunOptions {
     drain_ms: u64,
     with_mcp: bool,
     claude_args: Vec<String>,
+    permission_decision: PermissionDecisionMode,
+    permission_updates_key: String,
+}
+
+/// What the probe should answer a `PermissionRequest` hook with. `None` is the
+/// historical behavior (always 204, byte-for-byte unchanged) so existing
+/// captures stay comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionDecisionMode {
+    None,
+    Allow,
+    AllowWithSuggestions,
+    Deny,
+}
+
+impl PermissionDecisionMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "allow" => Ok(Self::Allow),
+            "allow-with-suggestions" => Ok(Self::AllowWithSuggestions),
+            "deny" => Ok(Self::Deny),
+            other => Err(format!(
+                "--permission-decision must be one of none, allow, allow-with-suggestions, deny (got {other})"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allow => "allow",
+            Self::AllowWithSuggestions => "allow-with-suggestions",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +99,12 @@ struct EvidenceRecord {
     prompt_id: Option<String>,
     body_sha256: String,
     body: Value,
+    /// The decision body actually returned to Claude for this request, or
+    /// `None` when nothing but the plain 204 went back (every non
+    /// `PermissionRequest` event, and `PermissionRequest` under `--permission-decision none`
+    /// or `--drop-response`). This is the only place events.jsonl records what
+    /// was answered, as opposed to what was received.
+    responded: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +117,7 @@ struct Counters {
     normal_overflow: AtomicU64,
     priority_overflow: AtomicU64,
     dropped_responses: AtomicU64,
+    permission_decisions_sent: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -85,6 +128,8 @@ struct ReceiverState {
     counters: Arc<Counters>,
     response_delay: Duration,
     drop_response: bool,
+    permission_decision: PermissionDecisionMode,
+    permission_updates_key: Arc<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +152,9 @@ struct RunSummary {
     normal_overflow: u64,
     priority_overflow: u64,
     dropped_responses: u64,
+    permission_decision: String,
+    permission_updates_key: String,
+    permission_decisions_sent: u64,
     events: BTreeMap<String, u64>,
 }
 
@@ -162,6 +210,9 @@ fn print_usage() {
          --response-delay-ms <n> --drop-response --refuse-connections\n\
          --flood-events <n> --writer-delay-ms <n> --drain-ms <n>\n\
          --output-root <path> --claude-arg <value>\n\
+         --permission-decision <none|allow|allow-with-suggestions|deny> (default: none)\n\
+         --permission-updates-key <name> (default: updatedPermissions;\n\
+         only used by allow-with-suggestions)\n\
          claude_hook_probe forward --observer <path>\n\
          claude_hook_probe mcp-fixture"
     );
@@ -181,6 +232,8 @@ fn parse_run_options(args: &[std::ffi::OsString]) -> Result<RunOptions, String> 
     let mut drain_ms = DEFAULT_DRAIN_MS;
     let mut with_mcp = false;
     let mut claude_args = Vec::new();
+    let mut permission_decision = PermissionDecisionMode::None;
+    let mut permission_updates_key = "updatedPermissions".to_string();
     let mut index = 0;
 
     while index < args.len() {
@@ -224,6 +277,16 @@ fn parse_run_options(args: &[std::ffi::OsString]) -> Result<RunOptions, String> 
             }
             "--with-mcp" => with_mcp = true,
             "--claude-arg" => claude_args.push(next_value(args, &mut index, "--claude-arg")?),
+            "--permission-decision" => {
+                permission_decision = PermissionDecisionMode::parse(&next_value(
+                    args,
+                    &mut index,
+                    "--permission-decision",
+                )?)?;
+            }
+            "--permission-updates-key" => {
+                permission_updates_key = next_value(args, &mut index, "--permission-updates-key")?;
+            }
             _ => return Err(format!("unknown run option: {flag}")),
         }
         index += 1;
@@ -251,6 +314,8 @@ fn parse_run_options(args: &[std::ffi::OsString]) -> Result<RunOptions, String> 
         drain_ms,
         with_mcp,
         claude_args,
+        permission_decision,
+        permission_updates_key,
     })
 }
 
@@ -356,6 +421,8 @@ async fn run_probe_async(options: RunOptions) -> Result<ExitCode, String> {
         counters: counters.clone(),
         response_delay: Duration::from_millis(options.response_delay_ms),
         drop_response: options.drop_response,
+        permission_decision: options.permission_decision,
+        permission_updates_key: Arc::new(options.permission_updates_key.clone()),
     };
     let receiver = if options.refuse_connections {
         drop(listener);
@@ -418,6 +485,9 @@ async fn run_probe_async(options: RunOptions) -> Result<ExitCode, String> {
         normal_overflow: counters.normal_overflow.load(Ordering::Relaxed),
         priority_overflow: counters.priority_overflow.load(Ordering::Relaxed),
         dropped_responses: counters.dropped_responses.load(Ordering::Relaxed),
+        permission_decision: options.permission_decision.as_str().to_string(),
+        permission_updates_key: options.permission_updates_key.clone(),
+        permission_decisions_sent: counters.permission_decisions_sent.load(Ordering::Relaxed),
         events: event_counts.lock().unwrap().clone(),
     };
     write_json(&run_dir.join("summary.json"), &summary)?;
@@ -501,6 +571,19 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, state: Recei
         .get("hook_event_name")
         .and_then(Value::as_str)
         .map(str::to_string);
+
+    // Only PermissionRequest gets a decision body, and only if the drop-response
+    // flag doesn't already mean nothing goes back over the wire at all.
+    let decision_body = if event.as_deref() == Some("PermissionRequest") && !state.drop_response {
+        permission_decision_body(
+            state.permission_decision,
+            body.get("permission_suggestions"),
+            &state.permission_updates_key,
+        )
+    } else {
+        None
+    };
+
     let record = EvidenceRecord {
         received_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         peer: peer.to_string(),
@@ -515,6 +598,7 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, state: Recei
             .map(str::to_string),
         body_sha256: hex::encode(Sha256::digest(&request.body)),
         body,
+        responded: decision_body.clone(),
     };
 
     let priority = event.as_deref().map(is_priority_event).unwrap_or(false);
@@ -547,7 +631,70 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr, state: Recei
             .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let _ = write_response(&mut stream, 204).await;
+    match &decision_body {
+        Some(body) => {
+            state
+                .counters
+                .permission_decisions_sent
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = write_json_response(&mut stream, 200, body).await;
+        }
+        None => {
+            let _ = write_response(&mut stream, 204).await;
+        }
+    }
+}
+
+/// Builds the JSON body to answer a `PermissionRequest` hook with, or `None`
+/// when the probe should fall back to the plain 204 (mode `none`, or
+/// `allow-with-suggestions` with nothing to suggest). Pure and side-effect
+/// free so it can be reasoned about (and eyeballed) without spinning up a
+/// server: it only assembles the fixed shape the hook protocol expects, it
+/// never inspects or restructures `suggestions` beyond checking for presence.
+fn permission_decision_body(
+    mode: PermissionDecisionMode,
+    suggestions: Option<&Value>,
+    updates_key: &str,
+) -> Option<Value> {
+    let decision = match mode {
+        PermissionDecisionMode::None => return None,
+        PermissionDecisionMode::Allow => json!({"behavior": "allow"}),
+        PermissionDecisionMode::Deny => json!({
+            "behavior": "deny",
+            "message": "probe denied"
+        }),
+        PermissionDecisionMode::AllowWithSuggestions => match suggestions {
+            Some(value) if is_present_and_nonempty(value) => {
+                // updates_key is a CLI flag (default "updatedPermissions") because
+                // the correct key for surfacing permission_suggestions back to
+                // Claude Code has not been confirmed yet; this lets the exact
+                // key be swapped at the command line without a rebuild.
+                let mut object = serde_json::Map::new();
+                object.insert("behavior".to_string(), json!("allow"));
+                object.insert(updates_key.to_string(), value.clone());
+                Value::Object(object)
+            }
+            // No suggestions on this request: fall back to a plain allow rather
+            // than emitting an empty/absent updates_key.
+            _ => json!({"behavior": "allow"}),
+        },
+    };
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": decision
+        }
+    }))
+}
+
+/// Whether a `permission_suggestions` value should be treated as carrying
+/// something to forward, as opposed to being absent or an empty array.
+fn is_present_and_nonempty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }
 }
 
 fn is_priority_event(event: &str) -> bool {
@@ -625,17 +772,35 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, Reques
     })
 }
 
-async fn write_response(stream: &mut TcpStream, status: u16) -> io::Result<()> {
-    let reason = match status {
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         413 => "Payload Too Large",
         _ => "Error",
-    };
-    let response =
-        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+}
+
+async fn write_response(stream: &mut TcpStream, status: u16) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        reason = reason_phrase(status)
+    );
     stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+async fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) -> io::Result<()> {
+    let payload = serde_json::to_vec(body).unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
+        reason = reason_phrase(status),
+        length = payload.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(&payload).await?;
     stream.shutdown().await
 }
 
