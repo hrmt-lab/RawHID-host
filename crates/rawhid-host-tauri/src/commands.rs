@@ -33,10 +33,10 @@ use rawhid_host_core::{
     },
     hid::{HidDeviceManager, HidError, ProbeResult},
     packet::{
-        AiActivityState, AiClientStatePacket, AiClientType, AiClientVariant, AiWorkPhase,
-        ComboBinding, ComboInfo, ComboItem, ConfigStatus, EncoderBinding, EncoderBindingFlags,
-        EncoderBindingSource, EncoderGetBindings, EncoderGetInfo, UplinkPacket,
-        CAPABILITY_AI_CLIENT_DISPLAY_SLOT,
+        AiActivityState, AiClientStatePacket, AiClientType, AiClientVariant, AiScreenKeyState,
+        AiWorkPhase, ComboBinding, ComboInfo, ComboItem, ConfigStatus, EncoderBinding,
+        EncoderBindingFlags, EncoderBindingSource, EncoderGetBindings, EncoderGetInfo,
+        UplinkPacket, CAPABILITY_AI_CLIENT_DISPLAY_SLOT,
     },
     pending_approval::PendingApprovalStore,
     runner::{uplink_device_key, RunEvent, Runner},
@@ -80,6 +80,14 @@ pub struct MonitorExtras {
     pub claude_integration: Arc<Mutex<Option<ClaudeIntegration>>>,
     pub ai_display_slots: Arc<Mutex<AiDisplaySelection>>,
     pub hud: Arc<Mutex<Option<HudCoordinator>>>,
+    /// The ScreenKey slot that most recently dispatched a HUD answer, and
+    /// when. Read by the monitor loop's per-slot ScreenKey state calculation
+    /// so that slot's display state is held at
+    /// `AiScreenKeyState::Responded` for `HUD_RESPONDED_HOLD` after the
+    /// answer, even though the underlying activity state has already moved
+    /// on (e.g. `WaitingApproval` -> `Working`). Set from
+    /// `actions::ActionOutcome::HudResponded` in `handle_uplink_events`.
+    pub hud_responded: Arc<Mutex<Option<(u8, Instant)>>>,
 }
 
 #[derive(Default)]
@@ -87,6 +95,14 @@ struct AiClientStateSendTracker {
     last_device_generation: Option<u64>,
     last_sent_at: Option<Instant>,
     last_slot_epoch: Option<u64>,
+    /// The `AiScreenKeyState` last actually sent for this slot. A mismatch
+    /// against the freshly computed value forces a full send on the current
+    /// tick, the same way `last_device_generation` does -- otherwise a
+    /// target switch or a `HUD_RESPONDED_HOLD` expiry between two sessions
+    /// that are both still `WaitingApproval` (so `activity_state` never
+    /// changes) would sit unsent until the next 5s heartbeat. See
+    /// `sync_ai_client_state_slot`.
+    last_screenkey_state: Option<AiScreenKeyState>,
     /// De-dup key for the last wire-send diagnostic actually recorded for
     /// this slot (see `AiWireSend`), so a heartbeat resend that repeats the
     /// exact same content is not logged again. A change-caused send, and any
@@ -96,21 +112,32 @@ struct AiClientStateSendTracker {
     /// exactly the kind of transition this diagnostic exists to catch, even
     /// when the state/phase/revision otherwise look unchanged. `devices` is
     /// part of the key so a send that reaches a different number of devices
-    /// is never treated as a repeat. See `push_wire_send`.
-    last_logged_send: Option<(AiClientType, AiActivityState, AiWorkPhase, u16, bool, usize)>,
+    /// is never treated as a repeat. `screenkey_state` is part of the key too,
+    /// so a hold expiring or a HUD target switching -- neither of which
+    /// bumps `revision` -- still gets logged. See `push_wire_send`.
+    last_logged_send: Option<(
+        AiClientType,
+        AiActivityState,
+        AiWorkPhase,
+        u16,
+        bool,
+        AiScreenKeyState,
+        usize,
+    )>,
 }
 
 impl AiClientStateSendTracker {
     /// Appends `send` to `sends` unless it repeats -- same client type,
-    /// activity state, work phase, revision, partial-send flag, and device
-    /// count -- the last diagnostic entry recorded for this slot AND its
-    /// cause is `Heartbeat`. Change-caused and `DeviceGeneration`-caused
-    /// sends are always appended: a device-generation bump signals a device
-    /// was lost or regained, which must never be swallowed by de-dup. This
-    /// only gates the diagnostic record: the wire send itself already
-    /// happened before this is called. Keeps the shared, unexported,
-    /// 200-entry app log (`MAX_LOG_ENTRIES`) usable across a session even
-    /// though heartbeats fire on every slot every 5s.
+    /// activity state, work phase, revision, partial-send flag, ScreenKey
+    /// display state, and device count -- the last diagnostic entry recorded
+    /// for this slot AND its cause is `Heartbeat`. Change-caused and
+    /// `DeviceGeneration`-caused sends are always appended: a
+    /// device-generation bump signals a device was lost or regained, which
+    /// must never be swallowed by de-dup. This only gates the diagnostic
+    /// record: the wire send itself already happened before this is called.
+    /// Keeps the shared, unexported, 200-entry app log (`MAX_LOG_ENTRIES`)
+    /// usable across a session even though heartbeats fire on every slot
+    /// every 5s.
     fn push_wire_send(&mut self, sends: &mut Vec<AiWireSend>, send: AiWireSend) {
         let key = (
             send.client_type,
@@ -118,6 +145,7 @@ impl AiClientStateSendTracker {
             send.work_phase,
             send.revision,
             send.work_phase_only,
+            send.screenkey_state,
             send.devices,
         );
         let is_periodic = matches!(send.cause, AiWireSendCause::Heartbeat);
@@ -4214,6 +4242,7 @@ pub fn start_host_link_worker(
         claude_integration: Arc::clone(&state.claude_integration),
         ai_display_slots: Arc::clone(&state.ai_display_slots),
         hud: Arc::clone(&state.hud),
+        hud_responded: Arc::new(Mutex::new(None)),
     };
 
     let (tx, rx) = mpsc::channel();
@@ -4715,11 +4744,20 @@ fn sync_ai_client_state<T>(
     changes: impl IntoIterator<Item = AiClientStateChange>,
     tracker: &mut AiClientStateSendTracker,
     now: Instant,
+    screenkey_state: AiScreenKeyState,
 ) -> Result<Vec<AiWireSend>, String>
 where
     T: AiClientStateTransport,
 {
-    sync_ai_client_state_slot(transport, 0, snapshot, changes, tracker, now)
+    sync_ai_client_state_slot(
+        transport,
+        0,
+        snapshot,
+        changes,
+        tracker,
+        now,
+        screenkey_state,
+    )
 }
 
 /// Why a wire send happened. Diagnostic-only, kept to enum names and
@@ -4729,6 +4767,24 @@ enum AiWireSendCause {
     Change(rawhid_host_core::AiClientStateChangeReason),
     Heartbeat,
     DeviceGeneration,
+    /// An immediate, out-of-tick resend right after `HostActionKind::HudConfirm`
+    /// dispatched an answer, so the `Responded` ScreenKey state reaches the
+    /// device without waiting for the next polling tick (see
+    /// `send_screenkey_state_immediately`).
+    HudResponded,
+    /// The computed `AiScreenKeyState` for this slot changed since the last
+    /// send even though nothing else did -- a HUD target switch or a
+    /// `HUD_RESPONDED_HOLD` expiry between two sessions that stay
+    /// `WaitingApproval` throughout never trips `Change`/`DeviceGeneration`,
+    /// so this forces a send within one tick instead of waiting up to
+    /// `AI_CLIENT_STATE_RESEND_INTERVAL`. See `sync_ai_client_state_slot`.
+    ScreenkeyStateChanged,
+    /// An immediate, out-of-tick resend right after
+    /// `HostActionKind::SelectHudTarget` moved the HUD's explicit target to a
+    /// new slot, covering both the newly targeted slot and the
+    /// previously-targeted one (see `send_screenkey_state_immediately` and
+    /// its caller in `handle_uplink_events`).
+    HudTargetSelected,
 }
 
 impl AiWireSendCause {
@@ -4737,6 +4793,9 @@ impl AiWireSendCause {
             Self::Change(reason) => format!("change/{reason:?}"),
             Self::Heartbeat => "heartbeat".to_string(),
             Self::DeviceGeneration => "device-generation".to_string(),
+            Self::HudResponded => "hud-responded".to_string(),
+            Self::ScreenkeyStateChanged => "screenkey-state-changed".to_string(),
+            Self::HudTargetSelected => "hud-target-selected".to_string(),
         }
     }
 }
@@ -4754,6 +4813,10 @@ struct AiWireSend {
     revision: u16,
     cause: AiWireSendCause,
     work_phase_only: bool,
+    /// The ScreenKey display-state byte carried in this send's packet (§8 of
+    /// `docs/ai-approval-hud-design.md`). Enum name and number only, same as
+    /// every other field here.
+    screenkey_state: AiScreenKeyState,
     /// `transport.send_ai_client_state`'s return value: how many devices the
     /// packet actually reached. This was previously discarded; zero here
     /// while the caller believed a device was capable is one of the things
@@ -4763,7 +4826,7 @@ struct AiWireSend {
 
 fn format_ai_wire_send(send: &AiWireSend) -> String {
     format!(
-        "ai wire slot={} client={:?} state={:?} phase={:?} rev={} cause={} partial={} devices={}",
+        "ai wire slot={} client={:?} state={:?} phase={:?} rev={} cause={} partial={} screenkey={:?} devices={}",
         send.slot,
         send.client_type,
         send.activity_state,
@@ -4771,6 +4834,7 @@ fn format_ai_wire_send(send: &AiWireSend) -> String {
         send.revision,
         send.cause.log_label(),
         send.work_phase_only,
+        send.screenkey_state,
         send.devices
     )
 }
@@ -4782,6 +4846,7 @@ fn sync_ai_client_state_slot<T>(
     changes: impl IntoIterator<Item = AiClientStateChange>,
     tracker: &mut AiClientStateSendTracker,
     now: Instant,
+    screenkey_state: AiScreenKeyState,
 ) -> Result<Vec<AiWireSend>, String>
 where
     T: AiClientStateTransport,
@@ -4791,10 +4856,11 @@ where
     let mut sends = Vec::new();
 
     for change in changes {
-        let packet = ai_client_state_packet_for_slot(change.state, display_slot)?;
+        let packet = ai_client_state_packet_for_slot(change.state, display_slot, screenkey_state)?;
         if !transport.has_ai_client_state_device(packet.client_type) {
             tracker.last_device_generation = None;
             tracker.last_sent_at = None;
+            tracker.last_screenkey_state = None;
             continue;
         }
         let work_phase_only =
@@ -4810,9 +4876,11 @@ where
                 revision: packet.revision,
                 cause: AiWireSendCause::Change(change.reason),
                 work_phase_only,
+                screenkey_state: packet.screenkey_state,
                 devices,
             },
         );
+        tracker.last_screenkey_state = Some(packet.screenkey_state);
         sent_change = true;
     }
 
@@ -4820,14 +4888,24 @@ where
         now.saturating_duration_since(last_sent) >= AI_CLIENT_STATE_RESEND_INTERVAL
     });
     let device_generation_changed = tracker.last_device_generation != Some(device_generation);
+    // A slot's ScreenKey display state can change (HUD target switched, or a
+    // `HUD_RESPONDED_HOLD` window just expired) without `activity_state`
+    // changing at all -- two sessions both stuck at `WaitingApproval` never
+    // produce a `Change`. Without this, such a switch would sit unsent until
+    // the next `AI_CLIENT_STATE_RESEND_INTERVAL` heartbeat (5s), which is far
+    // too slow for a HUD-target indicator meant to disambiguate which of
+    // several blinking slots the physical Confirm key currently answers.
+    let screenkey_state_changed = tracker.last_screenkey_state != Some(screenkey_state);
     if !sent_change
-        && (device_generation_changed || periodic_due)
+        && (device_generation_changed || periodic_due || screenkey_state_changed)
         && transport.has_ai_client_state_device(snapshot.client_type)
     {
-        let packet = ai_client_state_packet_for_slot(snapshot, display_slot)?;
+        let packet = ai_client_state_packet_for_slot(snapshot, display_slot, screenkey_state)?;
         let devices = transport.send_ai_client_state(packet, false)?;
         let cause = if device_generation_changed {
             AiWireSendCause::DeviceGeneration
+        } else if screenkey_state_changed {
+            AiWireSendCause::ScreenkeyStateChanged
         } else {
             AiWireSendCause::Heartbeat
         };
@@ -4841,9 +4919,11 @@ where
                 revision: packet.revision,
                 cause,
                 work_phase_only: false,
+                screenkey_state: packet.screenkey_state,
                 devices,
             },
         );
+        tracker.last_screenkey_state = Some(packet.screenkey_state);
         sent_change = true;
     }
 
@@ -4855,6 +4935,7 @@ where
     } else {
         tracker.last_device_generation = None;
         tracker.last_sent_at = None;
+        tracker.last_screenkey_state = None;
     }
     Ok(sends)
 }
@@ -4862,6 +4943,7 @@ where
 fn ai_client_state_packet_for_slot(
     state: AiClientStateSnapshot,
     display_slot: u8,
+    screenkey_state: AiScreenKeyState,
 ) -> Result<AiClientStatePacket, String> {
     AiClientStatePacket::new_for_slot(
         state.client_type,
@@ -4872,7 +4954,108 @@ fn ai_client_state_packet_for_slot(
         state.revision,
         display_slot,
     )
+    .map(|packet| packet.with_screenkey_state(screenkey_state))
     .map_err(|error| error.to_string())
+}
+
+/// How long a ScreenKey slot's display state is held at
+/// `AiScreenKeyState::Responded` after `HostActionKind::HudConfirm`
+/// dispatches an answer for it, per `docs/ai-approval-hud-design.md` §8's
+/// firmware confirmation animation. Without this hold, the very next state
+/// change (the resolved approval moving from `WaitingApproval` to `Working`)
+/// can arrive within one polling tick and overwrite byte nine before the
+/// animation finishes.
+///
+/// Firmware's playback is 700 ms, but the Host's hold and firmware's
+/// playback do not start at the same instant: the Host starts holding the
+/// moment it processes the Confirm `HOST_ACTION`, while firmware only starts
+/// animating once the following HID write actually arrives. A hold too close
+/// to firmware's playback time races that gap and was observed on real
+/// hardware (when firmware's playback was still 600 ms and this hold was 600
+/// ms) to let the hold expire -- and byte nine revert to the live computed
+/// state -- just before playback finished, truncating the checkmark
+/// animation's final frame. 850 ms gives 150 ms of margin over the HID write
+/// and firmware draw-start latency, comfortably longer than firmware's own
+/// 700 ms so the hold always outlives playback. This only widens the window
+/// byte nine is pinned to `Responded`; bytes 0..8 keep carrying the live
+/// state throughout, so no other display state is delayed by the extra
+/// margin.
+const HUD_RESPONDED_HOLD: Duration = Duration::from_millis(850);
+
+/// The `AiScreenKeyState` a slot should currently show, computed from its
+/// live waiting/target status (§8/§11: waiting-and-target, waiting-only, or
+/// normal) but overridden to `Responded` while that slot is within
+/// `HUD_RESPONDED_HOLD` of its last dispatched HUD answer. An expired hold
+/// entry is cleared here so it does not linger for a later, unrelated slot
+/// reusing the same index.
+fn screenkey_state_for_slot(
+    slot: u8,
+    computed: AiScreenKeyState,
+    hud_responded: &Mutex<Option<(u8, Instant)>>,
+    now: Instant,
+) -> AiScreenKeyState {
+    let mut responded = hud_responded.lock().unwrap();
+    match *responded {
+        Some((responded_slot, at)) if now.saturating_duration_since(at) < HUD_RESPONDED_HOLD => {
+            if responded_slot == slot {
+                return AiScreenKeyState::Responded;
+            }
+        }
+        Some(_) => {
+            *responded = None;
+        }
+        None => {}
+    }
+    computed
+}
+
+/// Whether a slot's own resolved Codex `(connection_id, thread_id)` is
+/// exactly the HUD's current target. `None` on either side is never a match
+/// -- a slot with no Codex target, or no HUD target at all, is not "the"
+/// target.
+fn is_hud_target(
+    slot_target: &Option<(String, String)>,
+    hud_target: &Option<(String, String)>,
+) -> bool {
+    matches!((slot_target, hud_target), (Some(a), Some(b)) if a == b)
+}
+
+/// The `AiScreenKeyState` a slot's live waiting/target status computes to,
+/// before the `HUD_RESPONDED_HOLD` override in `screenkey_state_for_slot`.
+/// Per `docs/ai-approval-hud-design.md` §8/§11: waiting on approval/input and
+/// the current HUD target, waiting but not the target, or neither.
+fn compute_screenkey_state(activity_state: AiActivityState, is_target: bool) -> AiScreenKeyState {
+    let waiting = matches!(
+        activity_state,
+        AiActivityState::WaitingApproval | AiActivityState::WaitingInput
+    );
+    match (waiting, is_target) {
+        (true, true) => AiScreenKeyState::WaitingTarget,
+        (true, false) => AiScreenKeyState::WaitingOther,
+        (false, _) => AiScreenKeyState::Normal,
+    }
+}
+
+/// Finds the one other slot (if any) whose last actually-sent ScreenKey
+/// state was `AiScreenKeyState::WaitingTarget`, excluding `new_slot`. Used
+/// by `ActionOutcome::HudTargetSelected` handling in `handle_uplink_events`
+/// so the previously-targeted slot's white frame is cleared in the same
+/// immediate send as the newly-targeted slot's, instead of surviving until
+/// the next tick. Excluding `new_slot` itself means a target switch that
+/// lands back on the slot already recorded as the target (a no-op switch,
+/// or the only slot with a live tracker) never produces a duplicate in the
+/// caller's send list.
+fn previously_targeted_slot(
+    ai_client_state_send: &BTreeMap<u8, AiClientStateSendTracker>,
+    new_slot: u8,
+) -> Option<u8> {
+    ai_client_state_send
+        .iter()
+        .find(|&(&slot, tracker)| {
+            slot != new_slot
+                && tracker.last_screenkey_state == Some(AiScreenKeyState::WaitingTarget)
+        })
+        .map(|(&slot, _)| slot)
 }
 
 fn apply_monitor_config(
@@ -4931,6 +5114,7 @@ fn process_command(
     extras: &MonitorExtras,
     actions_cfg: &mut ActionsConfig,
     automation_enabled: &mut bool,
+    ai_client_state_send: &mut BTreeMap<u8, AiClientStateSendTracker>,
 ) -> bool {
     match command {
         MonitorCommand::Shutdown => true,
@@ -4968,6 +5152,7 @@ fn process_command(
                     status,
                     log_entries,
                     log_counter,
+                    ai_client_state_send,
                 ) {
                     *automation_enabled = false;
                     update_status(app, status, |s| {
@@ -5081,6 +5266,112 @@ struct KeyPressPayload {
     pressed: bool,
 }
 
+/// Sends each of `slots`' freshly computed `AiScreenKeyState` right away,
+/// rather than waiting for the next polling tick (up to
+/// `polling.interval_ms`, 500 ms on real hardware). This is the single
+/// immediate-send path shared by every `ActionOutcome` that changes a slot's
+/// ScreenKey display state outside the regular monitor-loop tick --
+/// `HudResponded` (one slot: the one that was just answered) and
+/// `HudTargetSelected` (up to two slots: the newly targeted one and the
+/// previously targeted one) -- rather than two parallel send paths.
+///
+/// Each slot's state is computed exactly like the monitor loop's regular
+/// per-tick pass: `compute_screenkey_state` from its live waiting/target
+/// status against the HUD's current target, then `screenkey_state_for_slot`'s
+/// `HUD_RESPONDED_HOLD` override. Routing every immediate send through the
+/// same hold check means a slot currently holding `Responded` after a
+/// just-dispatched HUD answer keeps showing `Responded` here too, even when
+/// the same tick also fires an unrelated `HudTargetSelected` touching other
+/// slots -- the hold is never dropped as a side effect of another slot's
+/// immediate send.
+///
+/// The HUD target is read once, before `ai_display_slots` is locked per
+/// slot below -- never hold both locks at once (see the `hud`/
+/// `ai_display_slots` boundary in this module's monitor loop and
+/// `actions.rs`'s `HudConfirm` arm).
+///
+/// A missing slot snapshot falls back to `inactive_ai_snapshot()`; any
+/// encode or transport failure is logged via `tracing::warn!` and otherwise
+/// ignored -- this is a best-effort immediate nudge, and the regular
+/// monitor-loop sync a moment later still carries the authoritative state.
+///
+/// On success, also records the sent `AiScreenKeyState` as that slot's
+/// `AiClientStateSendTracker::last_screenkey_state`. Without this, the very
+/// next regular tick's `sync_ai_client_state_slot` would see a tracker that
+/// still thinks nothing was sent yet, treat the value as a fresh
+/// `screenkey_state_changed`, and immediately re-send the same packet.
+fn send_screenkey_state_immediately(
+    runner: &mut MonitorRunner,
+    extras: &MonitorExtras,
+    slots: &[u8],
+    cause: AiWireSendCause,
+    ai_client_state_send: &mut BTreeMap<u8, AiClientStateSendTracker>,
+) {
+    let hud_target_thread = extras
+        .hud
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|hud| hud.target_codex_thread());
+    let codex_snapshots = extras.codex_activity.snapshots();
+    let now = Instant::now();
+
+    for &slot in slots {
+        let (snapshot, target) = {
+            let selection = extras.ai_display_slots.lock().unwrap();
+            let snapshot = selection
+                .slot_snapshot(slot)
+                .unwrap_or_else(inactive_ai_snapshot);
+            let assigned = selection
+                .slots()
+                .get(usize::from(slot))
+                .and_then(|entry| entry.assigned.clone());
+            (
+                snapshot,
+                actions::codex_target_for_slot(assigned, codex_snapshots.clone()),
+            )
+        };
+        let computed = compute_screenkey_state(
+            snapshot.activity_state,
+            is_hud_target(&target, &hud_target_thread),
+        );
+        let screenkey_state = screenkey_state_for_slot(slot, computed, &extras.hud_responded, now);
+        let packet = match ai_client_state_packet_for_slot(snapshot, slot, screenkey_state) {
+            Ok(packet) => packet,
+            Err(error) => {
+                tracing::warn!(slot, "AI display slot immediate send encode error: {error}");
+                continue;
+            }
+        };
+        match runner.send_ai_client_state(packet, false) {
+            Ok(devices) => {
+                tracing::debug!(
+                    target: AI_DISPLAY_LOG_TARGET,
+                    "{}",
+                    format_ai_wire_send(&AiWireSend {
+                        slot,
+                        client_type: packet.client_type,
+                        activity_state: packet.activity_state,
+                        work_phase: packet.work_phase,
+                        revision: packet.revision,
+                        cause,
+                        work_phase_only: false,
+                        screenkey_state: packet.screenkey_state,
+                        devices,
+                    })
+                );
+                ai_client_state_send
+                    .entry(slot)
+                    .or_default()
+                    .last_screenkey_state = Some(packet.screenkey_state);
+            }
+            Err(error) => {
+                tracing::warn!(slot, "AI display slot immediate send failed: {error}");
+            }
+        }
+    }
+}
+
 /// Handle uplink events drained from the runner. Returns `true` when a
 /// HOST_ACTION requested the monitor loop to stop.
 fn handle_uplink_events(
@@ -5091,6 +5382,7 @@ fn handle_uplink_events(
     status: &Arc<std::sync::Mutex<MonitorStatus>>,
     log_entries: &Arc<std::sync::Mutex<std::collections::VecDeque<LogEntry>>>,
     log_counter: &Arc<std::sync::Mutex<u64>>,
+    ai_client_state_send: &mut BTreeMap<u8, AiClientStateSendTracker>,
 ) -> bool {
     let mut should_stop = false;
     for event in runner.take_uplink_events() {
@@ -5143,6 +5435,52 @@ fn handle_uplink_events(
                                 (
                                     "info",
                                     format!("host action {}: stop monitoring", action.action_id),
+                                )
+                            }
+                            Ok(actions::ActionOutcome::HudResponded { slot }) => {
+                                *extras.hud_responded.lock().unwrap() =
+                                    Some((slot, Instant::now()));
+                                send_screenkey_state_immediately(
+                                    runner,
+                                    extras,
+                                    &[slot],
+                                    AiWireSendCause::HudResponded,
+                                    ai_client_state_send,
+                                );
+                                (
+                                    "info",
+                                    format!(
+                                        "host action {} executed ({:?}) hud_responded slot={}",
+                                        action.action_id, binding.action, slot
+                                    ),
+                                )
+                            }
+                            Ok(actions::ActionOutcome::HudTargetSelected { slot }) => {
+                                // Also resend whichever slot was `WaitingTarget`
+                                // before this switch (if any and if different),
+                                // so its white frame disappears in the same
+                                // immediate send instead of surviving until the
+                                // next tick -- otherwise two slots would
+                                // briefly appear to be the HUD target at once.
+                                let mut slots = vec![slot];
+                                if let Some(previous_slot) =
+                                    previously_targeted_slot(ai_client_state_send, slot)
+                                {
+                                    slots.push(previous_slot);
+                                }
+                                send_screenkey_state_immediately(
+                                    runner,
+                                    extras,
+                                    &slots,
+                                    AiWireSendCause::HudTargetSelected,
+                                    ai_client_state_send,
+                                );
+                                (
+                                    "info",
+                                    format!(
+                                        "host action {} executed ({:?}) hud_target_selected slot={}",
+                                        action.action_id, binding.action, slot
+                                    ),
                                 )
                             }
                             Err(error) => (
@@ -5290,6 +5628,7 @@ fn run_monitor_loop(
                         &extras,
                         &mut actions_cfg,
                         &mut automation_enabled,
+                        &mut ai_client_state_send,
                     ) {
                         should_stop = true;
                         break;
@@ -5361,6 +5700,7 @@ fn run_monitor_loop(
                 &status,
                 &log_entries,
                 &log_counter,
+                &mut ai_client_state_send,
             ) {
                 automation_enabled = false;
                 update_status(&app, &status, |s| {
@@ -5428,6 +5768,18 @@ fn run_monitor_loop(
                 &extras.codex_activity.pending_approvals(),
                 now,
             );
+        // The HUD's current Codex target, read before the `ai_display_slots`
+        // lock is taken below -- never hold both locks at once (see the
+        // `hud`/`ai_display_slots` boundary in `actions.rs`'s `HudConfirm`
+        // arm). Compared against each slot's own resolved Codex target to
+        // decide `AiScreenKeyState::WaitingTarget` vs `WaitingOther`; see
+        // `compute_screenkey_state`.
+        let hud_target_thread = extras
+            .hud
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|hud| hud.target_codex_thread());
         let (
             ai_snapshot,
             ai_changes,
@@ -5435,6 +5787,7 @@ fn run_monitor_loop(
             retired_slots,
             extra_slots,
             slot_assignment_logs,
+            slot0_screenkey_state,
         ) = {
             let mut selection = extras.ai_display_slots.lock().unwrap();
             let (snapshot, changes) = selected_ai_output_with_targets(
@@ -5456,56 +5809,76 @@ fn run_monitor_loop(
                     .map(|snapshot| snapshot.thread_id.clone()),
                 _ => None,
             };
+            let slot0_target = actions::codex_target_for_slot(
+                selection.selected_target().cloned(),
+                codex_snapshots.clone(),
+            );
+            let slot0_screenkey_state = compute_screenkey_state(
+                snapshot.activity_state,
+                is_hud_target(&slot0_target, &hud_target_thread),
+            );
             let retired_slots = selection.take_retired_slots();
-            let extra_slots: Vec<(u8, AiClientStateSnapshot, Vec<AiClientStateChange>, u64)> =
-                selection
-                    .slots()
-                    .iter()
-                    .filter(|entry| entry.slot != 0)
-                    .map(|entry| {
-                        let snapshot = selection
-                            .slot_snapshot(entry.slot)
-                            .unwrap_or_else(inactive_ai_snapshot);
-                        let changes = match entry.assigned.as_ref() {
-                            Some(AiDisplayTarget::Codex { terminal_target_id }) => codex_changes
-                                .iter()
-                                .filter(|change| {
-                                    // Same fix as `selected_ai_output_with_targets`:
-                                    // a `terminal_target_id` match alone also
-                                    // admits the throwaway title-generation
-                                    // thread Codex CLI spawns after the first
-                                    // user message, so also require the change's
-                                    // thread to still be this connection's
-                                    // display target.
-                                    change.terminal_target_id == *terminal_target_id
-                                        && codex_snapshots.iter().any(|snapshot| {
-                                            snapshot.state.session_active
-                                                && snapshot.is_display_target
-                                                && snapshot.thread_id == change.thread_id
-                                        })
-                                })
-                                .map(|change| AiClientStateChange {
-                                    state: change.state,
-                                    reason: change.reason,
-                                })
-                                .collect(),
-                            Some(AiDisplayTarget::Claude { terminal_target_id }) => claude_changes
-                                .iter()
-                                .filter(|change| {
-                                    claude_terminal_targets.get(&change.state.launch_id)
-                                        == Some(terminal_target_id)
-                                })
-                                .map(|change| AiClientStateChange {
-                                    state: claude_as_ai_snapshot(Some(change.state.clone())),
-                                    reason:
-                                        rawhid_host_core::AiClientStateChangeReason::SessionStarted,
-                                })
-                                .collect(),
-                            None => Vec::new(),
-                        };
-                        (entry.slot, snapshot, changes, entry.epoch)
-                    })
-                    .collect();
+            let extra_slots: Vec<(
+                u8,
+                AiClientStateSnapshot,
+                Vec<AiClientStateChange>,
+                u64,
+                AiScreenKeyState,
+            )> = selection
+                .slots()
+                .iter()
+                .filter(|entry| entry.slot != 0)
+                .map(|entry| {
+                    let snapshot = selection
+                        .slot_snapshot(entry.slot)
+                        .unwrap_or_else(inactive_ai_snapshot);
+                    let changes = match entry.assigned.as_ref() {
+                        Some(AiDisplayTarget::Codex { terminal_target_id }) => codex_changes
+                            .iter()
+                            .filter(|change| {
+                                // Same fix as `selected_ai_output_with_targets`:
+                                // a `terminal_target_id` match alone also
+                                // admits the throwaway title-generation
+                                // thread Codex CLI spawns after the first
+                                // user message, so also require the change's
+                                // thread to still be this connection's
+                                // display target.
+                                change.terminal_target_id == *terminal_target_id
+                                    && codex_snapshots.iter().any(|snapshot| {
+                                        snapshot.state.session_active
+                                            && snapshot.is_display_target
+                                            && snapshot.thread_id == change.thread_id
+                                    })
+                            })
+                            .map(|change| AiClientStateChange {
+                                state: change.state,
+                                reason: change.reason,
+                            })
+                            .collect(),
+                        Some(AiDisplayTarget::Claude { terminal_target_id }) => claude_changes
+                            .iter()
+                            .filter(|change| {
+                                claude_terminal_targets.get(&change.state.launch_id)
+                                    == Some(terminal_target_id)
+                            })
+                            .map(|change| AiClientStateChange {
+                                state: claude_as_ai_snapshot(Some(change.state.clone())),
+                                reason: rawhid_host_core::AiClientStateChangeReason::SessionStarted,
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    let target = actions::codex_target_for_slot(
+                        entry.assigned.clone(),
+                        codex_snapshots.clone(),
+                    );
+                    let screenkey_state = compute_screenkey_state(
+                        snapshot.activity_state,
+                        is_hud_target(&target, &hud_target_thread),
+                    );
+                    (entry.slot, snapshot, changes, entry.epoch, screenkey_state)
+                })
+                .collect();
             // Diagnostic for the reported ScreenKey display glitches: log a
             // slot's assignment only when its target or epoch actually
             // changed since the loop last saw it, covering slot 0 too
@@ -5544,6 +5917,7 @@ fn run_monitor_loop(
                 retired_slots,
                 extra_slots,
                 slot_assignment_logs,
+                slot0_screenkey_state,
             )
         };
         for message in slot_assignment_logs {
@@ -5565,6 +5939,7 @@ fn run_monitor_loop(
             ai_changes,
             ai_client_state_send.entry(0).or_default(),
             now,
+            screenkey_state_for_slot(0, slot0_screenkey_state, &extras.hud_responded, now),
         ) {
             Ok(sends) => {
                 for send in sends {
@@ -5589,6 +5964,7 @@ fn run_monitor_loop(
                 }],
                 ai_client_state_send.entry(slot).or_default(),
                 now,
+                AiScreenKeyState::Normal,
             ) {
                 Ok(sends) => {
                     for send in sends {
@@ -5601,7 +5977,9 @@ fn run_monitor_loop(
             }
             ai_client_state_send.remove(&slot);
         }
-        for (slot, snapshot, changes, epoch) in extra_slots {
+        for (slot, snapshot, changes, epoch, screenkey_state) in extra_slots {
+            let screenkey_state =
+                screenkey_state_for_slot(slot, screenkey_state, &extras.hud_responded, now);
             let tracker = ai_client_state_send.entry(slot).or_default();
             let assignment_changed = tracker.last_slot_epoch != Some(epoch);
             let result = if assignment_changed && changes.is_empty() {
@@ -5617,9 +5995,18 @@ fn run_monitor_loop(
                     }],
                     tracker,
                     now,
+                    screenkey_state,
                 )
             } else {
-                sync_ai_client_state_slot(&mut runner, slot, snapshot, changes, tracker, now)
+                sync_ai_client_state_slot(
+                    &mut runner,
+                    slot,
+                    snapshot,
+                    changes,
+                    tracker,
+                    now,
+                    screenkey_state,
+                )
             };
             match result {
                 Ok(sends) => {
@@ -5657,6 +6044,7 @@ fn run_monitor_loop(
                         &extras,
                         &mut actions_cfg,
                         &mut automation_enabled,
+                        &mut ai_client_state_send,
                     ) {
                         should_stop = true;
                     }
@@ -5678,6 +6066,7 @@ fn run_monitor_loop(
                     &status,
                     &log_entries,
                     &log_counter,
+                    &mut ai_client_state_send,
                 ) {
                     automation_enabled = false;
                     update_status(&app, &status, |s| {
@@ -6205,6 +6594,7 @@ mod tests {
             vec![ai_change(available), ai_change(working)],
             &mut tracker,
             now,
+            AiScreenKeyState::Normal,
         )
         .unwrap();
 
@@ -6233,6 +6623,7 @@ mod tests {
             [work_phase_change(working)],
             &mut tracker,
             Instant::now(),
+            AiScreenKeyState::Normal,
         )
         .unwrap();
 
@@ -6252,10 +6643,34 @@ mod tests {
         let snapshot = ai_state(AiActivityState::WaitingApproval, 90);
         let now = Instant::now();
 
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
         transport.device_generation = 8;
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
 
         assert_eq!(transport.sent.len(), 2);
         assert!(transport
@@ -6282,13 +6697,22 @@ mod tests {
             vec![ai_change(snapshot)],
             &mut tracker,
             now,
+            AiScreenKeyState::Normal,
         )
         .unwrap();
         assert!(transport.sent.is_empty());
         assert_eq!(tracker.last_device_generation, None);
 
         transport.capable = true;
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(transport.sent[0].activity_state, AiActivityState::Completed);
         assert_eq!(transport.sent[0].revision, 12);
@@ -6312,13 +6736,22 @@ mod tests {
             [ai_change(snapshot)],
             &mut tracker,
             now,
+            AiScreenKeyState::Normal,
         )
         .unwrap();
         assert!(transport.sent.is_empty());
         assert_eq!(tracker.last_device_generation, None);
 
         transport.claude_capable = true;
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(transport.sent[0].client_type, AiClientType::ClaudeCode);
     }
@@ -6334,13 +6767,22 @@ mod tests {
         let snapshot = ai_state(AiActivityState::Completed, 1234);
         let now = Instant::now();
 
-        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now).unwrap();
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::Normal,
+        )
+        .unwrap();
         sync_ai_client_state(
             &mut transport,
             snapshot,
             [],
             &mut tracker,
             now + Duration::from_secs(4),
+            AiScreenKeyState::Normal,
         )
         .unwrap();
         sync_ai_client_state(
@@ -6349,11 +6791,357 @@ mod tests {
             [],
             &mut tracker,
             now + Duration::from_secs(5),
+            AiScreenKeyState::Normal,
         )
         .unwrap();
 
         assert_eq!(transport.sent.len(), 2);
         assert!(transport.sent.iter().all(|packet| packet.revision == 1234));
+    }
+
+    #[test]
+    fn sync_ai_client_state_carries_the_screenkey_state_into_every_sent_packet() {
+        let mut transport = FakeAiClientTransport {
+            device_generation: 1,
+            capable: true,
+            ..Default::default()
+        };
+        let mut tracker = AiClientStateSendTracker::default();
+        let available = ai_state(AiActivityState::Available, 1);
+        let working = ai_state(AiActivityState::WaitingApproval, 2);
+        let now = Instant::now();
+
+        sync_ai_client_state(
+            &mut transport,
+            working,
+            vec![ai_change(available), ai_change(working)],
+            &mut tracker,
+            now,
+            AiScreenKeyState::WaitingTarget,
+        )
+        .unwrap();
+
+        assert_eq!(transport.sent.len(), 2);
+        assert!(transport
+            .sent
+            .iter()
+            .all(|packet| packet.screenkey_state == AiScreenKeyState::WaitingTarget));
+    }
+
+    #[test]
+    fn sync_ai_client_state_sends_immediately_when_only_screenkey_state_changes() {
+        // Two sessions both stuck at `WaitingApproval` never produce an
+        // `AiClientStateChange` when the HUD target switches between them --
+        // `activity_state` never moves. Without forcing a send on a
+        // `screenkey_state` mismatch, this slot's display would sit stale
+        // until the next `AI_CLIENT_STATE_RESEND_INTERVAL` heartbeat (5s).
+        let mut transport = FakeAiClientTransport {
+            device_generation: 1,
+            capable: true,
+            ..Default::default()
+        };
+        let mut tracker = AiClientStateSendTracker::default();
+        let snapshot = ai_state(AiActivityState::WaitingApproval, 42);
+        let now = Instant::now();
+
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::WaitingOther,
+        )
+        .unwrap();
+        assert_eq!(transport.sent.len(), 1);
+        assert_eq!(
+            transport.sent[0].screenkey_state,
+            AiScreenKeyState::WaitingOther
+        );
+
+        // No activity change, no device-generation change, and well within
+        // the 5s heartbeat window -- only `screenkey_state` differs.
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now + Duration::from_millis(50),
+            AiScreenKeyState::WaitingTarget,
+        )
+        .unwrap();
+
+        assert_eq!(transport.sent.len(), 2);
+        assert_eq!(
+            transport.sent[1].screenkey_state,
+            AiScreenKeyState::WaitingTarget
+        );
+    }
+
+    #[test]
+    fn sync_ai_client_state_suppresses_resend_when_nothing_changed() {
+        // Existing behavior must survive: identical activity state AND
+        // identical screenkey_state, well before the heartbeat interval,
+        // sends nothing on the second call.
+        let mut transport = FakeAiClientTransport {
+            device_generation: 1,
+            capable: true,
+            ..Default::default()
+        };
+        let mut tracker = AiClientStateSendTracker::default();
+        let snapshot = ai_state(AiActivityState::WaitingApproval, 7);
+        let now = Instant::now();
+
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now,
+            AiScreenKeyState::WaitingOther,
+        )
+        .unwrap();
+        assert_eq!(transport.sent.len(), 1);
+
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now + Duration::from_millis(50),
+            AiScreenKeyState::WaitingOther,
+        )
+        .unwrap();
+
+        assert_eq!(transport.sent.len(), 1, "unchanged state must not resend");
+    }
+
+    #[test]
+    fn compute_screenkey_state_covers_target_other_and_normal() {
+        assert_eq!(
+            compute_screenkey_state(AiActivityState::WaitingApproval, true),
+            AiScreenKeyState::WaitingTarget
+        );
+        assert_eq!(
+            compute_screenkey_state(AiActivityState::WaitingInput, true),
+            AiScreenKeyState::WaitingTarget
+        );
+        assert_eq!(
+            compute_screenkey_state(AiActivityState::WaitingApproval, false),
+            AiScreenKeyState::WaitingOther
+        );
+        assert_eq!(
+            compute_screenkey_state(AiActivityState::Working, true),
+            AiScreenKeyState::Normal
+        );
+        assert_eq!(
+            compute_screenkey_state(AiActivityState::None, false),
+            AiScreenKeyState::Normal
+        );
+    }
+
+    #[test]
+    fn is_hud_target_requires_both_sides_present_and_equal() {
+        let a = Some(("connection-a".to_string(), "thread-a".to_string()));
+        let b = Some(("connection-b".to_string(), "thread-b".to_string()));
+        assert!(is_hud_target(&a, &a));
+        assert!(!is_hud_target(&a, &b));
+        assert!(!is_hud_target(&a, &None));
+        assert!(!is_hud_target(&None, &a));
+        assert!(!is_hud_target(&None, &None));
+    }
+
+    #[test]
+    fn screenkey_state_for_slot_holds_responded_then_reverts_to_computed() {
+        let hud_responded = Mutex::new(None);
+        let now = Instant::now();
+
+        // No hold recorded yet: the computed value passes through unchanged.
+        assert_eq!(
+            screenkey_state_for_slot(0, AiScreenKeyState::WaitingOther, &hud_responded, now),
+            AiScreenKeyState::WaitingOther
+        );
+
+        *hud_responded.lock().unwrap() = Some((2, now));
+
+        // A different slot is unaffected by another slot's hold.
+        assert_eq!(
+            screenkey_state_for_slot(0, AiScreenKeyState::Normal, &hud_responded, now),
+            AiScreenKeyState::Normal
+        );
+        // The held slot is forced to `Responded` regardless of its computed
+        // value, right up to the hold boundary.
+        assert_eq!(
+            screenkey_state_for_slot(
+                2,
+                AiScreenKeyState::WaitingTarget,
+                &hud_responded,
+                now + HUD_RESPONDED_HOLD - Duration::from_millis(1),
+            ),
+            AiScreenKeyState::Responded
+        );
+        // Once the hold has fully elapsed, the computed value takes over
+        // again and the stale entry is cleared.
+        assert_eq!(
+            screenkey_state_for_slot(
+                2,
+                AiScreenKeyState::WaitingTarget,
+                &hud_responded,
+                now + HUD_RESPONDED_HOLD,
+            ),
+            AiScreenKeyState::WaitingTarget
+        );
+        assert!(hud_responded.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn hud_responded_hold_expiry_forces_a_resend_even_without_an_activity_change() {
+        // End-to-end check that `screenkey_state_for_slot`'s hold expiry and
+        // `sync_ai_client_state_slot`'s `screenkey_state_changed` forcing
+        // compose correctly: the slot's `activity_state` never changes
+        // (`Working` throughout, no `AiClientStateChange` at all), yet the
+        // tick right after `HUD_RESPONDED_HOLD` elapses must still send,
+        // carrying the reverted-to-computed state instead of a stale
+        // `Responded`.
+        let hud_responded = Mutex::new(Some((0u8, Instant::now())));
+        let mut transport = FakeAiClientTransport {
+            device_generation: 1,
+            capable: true,
+            ..Default::default()
+        };
+        let mut tracker = AiClientStateSendTracker::default();
+        let snapshot = ai_state(AiActivityState::Working, 9);
+        let now = Instant::now();
+
+        let held = screenkey_state_for_slot(0, AiScreenKeyState::Normal, &hud_responded, now);
+        assert_eq!(held, AiScreenKeyState::Responded);
+        sync_ai_client_state(&mut transport, snapshot, [], &mut tracker, now, held).unwrap();
+        assert_eq!(transport.sent.len(), 1);
+        assert_eq!(
+            transport.sent[0].screenkey_state,
+            AiScreenKeyState::Responded
+        );
+
+        let after_hold = screenkey_state_for_slot(
+            0,
+            AiScreenKeyState::Normal,
+            &hud_responded,
+            now + HUD_RESPONDED_HOLD,
+        );
+        assert_eq!(after_hold, AiScreenKeyState::Normal);
+        sync_ai_client_state(
+            &mut transport,
+            snapshot,
+            [],
+            &mut tracker,
+            now + HUD_RESPONDED_HOLD + Duration::from_millis(1),
+            after_hold,
+        )
+        .unwrap();
+
+        assert_eq!(transport.sent.len(), 2, "hold expiry must force a resend");
+        assert_eq!(transport.sent[1].screenkey_state, AiScreenKeyState::Normal);
+    }
+
+    #[test]
+    fn target_switch_computes_waiting_target_for_the_new_slot_and_waiting_other_for_the_old_one() {
+        // Both sessions sit at `WaitingApproval` throughout a
+        // `HostActionKind::SelectHudTarget` switch -- exactly the scenario
+        // that motivated `send_screenkey_state_immediately`, since neither
+        // slot's `activity_state` moves. The new slot's own resolved Codex
+        // target now matches the HUD's target; the old slot's does not.
+        let old_target = Some(("connection-a".to_string(), "thread-a".to_string()));
+        let new_target = Some(("connection-b".to_string(), "thread-b".to_string()));
+
+        // Before the switch: HUD target is the old slot's session.
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&old_target, &old_target),
+            ),
+            AiScreenKeyState::WaitingTarget
+        );
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&new_target, &old_target),
+            ),
+            AiScreenKeyState::WaitingOther
+        );
+
+        // After the switch: HUD target is the new slot's session. The old
+        // slot, still `WaitingApproval`, now reads `WaitingOther`; the new
+        // slot reads `WaitingTarget`.
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&new_target, &new_target),
+            ),
+            AiScreenKeyState::WaitingTarget
+        );
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&old_target, &new_target),
+            ),
+            AiScreenKeyState::WaitingOther
+        );
+    }
+
+    #[test]
+    fn a_target_switch_immediate_send_never_overrides_an_active_responded_hold() {
+        // A slot within its `HUD_RESPONDED_HOLD` window must keep showing
+        // `Responded` even when the *reason* for this tick's immediate send
+        // is an unrelated `HudTargetSelected` touching a different slot.
+        // `send_screenkey_state_immediately` computes each slot independently
+        // and always routes through `screenkey_state_for_slot`, so the cause
+        // of the send never enters this decision.
+        let hud_responded = Mutex::new(Some((3u8, Instant::now())));
+        let now = Instant::now();
+
+        // Slot 3 just answered and is mid-hold; left to its own computed
+        // value it would already be back to `WaitingOther` (session resolved,
+        // no longer the HUD target) -- but the hold must still win.
+        assert_eq!(
+            screenkey_state_for_slot(3, AiScreenKeyState::WaitingOther, &hud_responded, now),
+            AiScreenKeyState::Responded
+        );
+        // A different slot in the same immediate send is unaffected and gets
+        // its own freshly computed value.
+        assert_eq!(
+            screenkey_state_for_slot(5, AiScreenKeyState::WaitingTarget, &hud_responded, now),
+            AiScreenKeyState::WaitingTarget
+        );
+    }
+
+    #[test]
+    fn previously_targeted_slot_finds_the_other_waiting_target_slot() {
+        let mut trackers = BTreeMap::<u8, AiClientStateSendTracker>::new();
+        trackers.insert(2, AiClientStateSendTracker::default());
+        trackers.entry(2).or_default().last_screenkey_state = Some(AiScreenKeyState::WaitingTarget);
+
+        assert_eq!(previously_targeted_slot(&trackers, 5), Some(2));
+    }
+
+    #[test]
+    fn previously_targeted_slot_is_none_when_no_other_slot_was_the_target() {
+        let mut trackers = BTreeMap::<u8, AiClientStateSendTracker>::new();
+        trackers.entry(1).or_default().last_screenkey_state = Some(AiScreenKeyState::WaitingOther);
+        trackers.entry(2).or_default().last_screenkey_state = Some(AiScreenKeyState::Normal);
+
+        assert_eq!(previously_targeted_slot(&trackers, 9), None);
+    }
+
+    #[test]
+    fn previously_targeted_slot_excludes_the_new_slot_itself_to_avoid_a_duplicate() {
+        // If the only tracker recorded as `WaitingTarget` is the slot that
+        // was *just* selected (a same-slot "switch", or a stale leftover from
+        // before this exact slot became the target), it must not be returned
+        // -- the caller would otherwise resend the same slot twice.
+        let mut trackers = BTreeMap::<u8, AiClientStateSendTracker>::new();
+        trackers.entry(4).or_default().last_screenkey_state = Some(AiScreenKeyState::WaitingTarget);
+
+        assert_eq!(previously_targeted_slot(&trackers, 4), None);
     }
 
     #[test]

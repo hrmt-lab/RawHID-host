@@ -526,6 +526,19 @@ impl HudCoordinator {
         self.interaction.lock().unwrap().shown_at()
     }
 
+    /// The exact Codex `(connection_id, thread_id)` of the request currently
+    /// shown as the HUD target, for slot-vs-target comparisons
+    /// (`actions.rs`'s `codex_target_for_slot`, `commands.rs`'s per-slot
+    /// ScreenKey state calculation). `None` when nothing is shown, or the
+    /// target is a Claude Code request, or its thread id is unknown. Like
+    /// `ApprovalKey::codex_thread`, the returned pair must never reach a HUD
+    /// payload or a Host Link packet.
+    pub fn target_codex_thread(&self) -> Option<(String, String)> {
+        let interaction = self.interaction.lock().unwrap();
+        let (connection_id, thread_id) = interaction.target()?.codex_thread()?;
+        Some((connection_id.to_string(), thread_id.to_string()))
+    }
+
     fn show(&self) {
         let (x, y, w, h) = hud_geometry(&self.window);
         self.window.show_at(x, y, w, h);

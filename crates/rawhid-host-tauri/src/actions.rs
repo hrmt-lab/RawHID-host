@@ -31,6 +31,26 @@ pub enum ActionOutcome {
     /// Automatic monitoring should stop while the Host Link worker remains
     /// available for discovery and keymap Config RPC.
     StopRequested,
+    /// A HUD Confirm actually dispatched an answer, and the ScreenKey slot it
+    /// answered for was resolved. `commands.rs`'s monitor loop uses this to
+    /// hold that slot's ScreenKey state at `AiScreenKeyState::Responded` for
+    /// a short window (see its `HUD_RESPONDED_HOLD` hold logic) and to send
+    /// that slot's packet immediately rather than waiting for the next tick.
+    HudResponded {
+        slot: u8,
+    },
+    /// `HostActionKind::SelectHudTarget` actually moved the HUD's explicit
+    /// target to this ScreenKey slot (it did not fall back to
+    /// `focus_ai_terminal_for_slot`). `commands.rs`'s `handle_uplink_events`
+    /// uses this to immediately resend this slot's (and, if there was one,
+    /// the previously-targeted slot's) ScreenKey state, rather than waiting
+    /// for the next tick -- a target switch alone never changes
+    /// `activity_state`, so `sync_ai_client_state_slot` would otherwise not
+    /// force a send until `screenkey_state_changed` catches it on the next
+    /// tick.
+    HudTargetSelected {
+        slot: u8,
+    },
 }
 
 pub fn execute(
@@ -127,12 +147,25 @@ pub fn execute(
         )),
         HostActionKind::HudConfirm => {
             let pending = extras.codex_activity.pending_approvals();
-            let dispatch = extras
-                .hud
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|hud| hud.begin_response(&pending, Instant::now()));
+            // Read the live target and reserve the response under the same
+            // `hud` lock acquisition, then drop it before touching any other
+            // lock (`ai_display_slots`) below -- see this module's
+            // `move_hud_selection_and_render` doc comment on not holding the
+            // lock used for one step across another.
+            let (dispatch, target_thread) = {
+                let hud_guard = extras.hud.lock().unwrap();
+                let Some(hud) = hud_guard.as_ref() else {
+                    return Ok(ActionOutcome::HudNoop {
+                        reason: "hud_response_in_flight_guard_or_no_selection",
+                    });
+                };
+                let dispatch = hud.begin_response(&pending, Instant::now());
+                let target_thread = match &dispatch {
+                    Some(_) => hud.target_codex_thread(),
+                    None => None,
+                };
+                (dispatch, target_thread)
+            };
             let Some(dispatch) = dispatch else {
                 return Ok(ActionOutcome::HudNoop {
                     reason: "hud_response_in_flight_guard_or_no_selection",
@@ -141,7 +174,11 @@ pub fn execute(
             // `respond_to_approval` may wait for the App Server response.
             // Never make the Host Link monitor loop wait for that round trip.
             dispatch_hud_response(pending, extras.codex_broker.clone(), dispatch);
-            Ok(ActionOutcome::Continue)
+            let slot = target_thread.and_then(|target| resolve_hud_target_slot(extras, &target));
+            match slot {
+                Some(slot) => Ok(ActionOutcome::HudResponded { slot }),
+                None => Ok(ActionOutcome::Continue),
+            }
         }
         HostActionKind::HudReject => {
             // Reject only relocates the highlight to the reject-side decision
@@ -188,7 +225,7 @@ pub fn execute(
             if let Some(hud) = extras.hud.lock().unwrap().as_ref() {
                 hud.update(app, &pending);
             }
-            Ok(ActionOutcome::Continue)
+            Ok(ActionOutcome::HudTargetSelected { slot: value })
         }
     }
 }
@@ -282,7 +319,27 @@ fn focus_ai_terminal_for_slot(value: u8, extras: &MonitorExtras) -> Result<Actio
     Ok(ActionOutcome::Continue)
 }
 
-fn codex_target_for_slot(
+/// Finds which ScreenKey slot is assigned the exact Codex `(connection_id,
+/// thread_id)` that just received a HUD answer, by reusing the same
+/// predicate (`codex_target_for_slot`) that decides whether a slot is the
+/// HUD's current target elsewhere (`commands.rs`'s per-slot ScreenKey state
+/// calculation, `HostActionKind::SelectHudTarget` above). Reusing rather than
+/// re-deriving this comparison is deliberate -- see the 2026-09-04 handoff
+/// note on keeping "which slot counts as the target" as one predicate.
+fn resolve_hud_target_slot(extras: &MonitorExtras, target: &(String, String)) -> Option<u8> {
+    let snapshots = extras.codex_activity.snapshots();
+    let slots = extras.ai_display_slots.lock().unwrap();
+    slots
+        .slots()
+        .iter()
+        .find(|entry| {
+            codex_target_for_slot(entry.assigned.clone(), snapshots.clone()).as_ref()
+                == Some(target)
+        })
+        .map(|entry| entry.slot)
+}
+
+pub(crate) fn codex_target_for_slot(
     assigned: Option<AiDisplayTarget>,
     snapshots: Vec<CodexSessionSnapshot>,
 ) -> Option<(String, String)> {
