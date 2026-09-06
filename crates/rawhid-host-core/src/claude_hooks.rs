@@ -16,13 +16,25 @@ pub const CLAUDE_SESSION_START_TIMEOUT_SECONDS: u64 = 2;
 /// other hook: this is the one hook Studio holds open waiting for a HUD
 /// decision (`docs/ai-approval-hud-design.md` §9.2), long enough for a
 /// person to actually read the HUD and press a key.
-/// `docs/claude-permission-hook-gate-results.md` §Q6 confirmed this is safe
-/// to extend -- Claude Code never waits for the hook itself (it shows its
-/// own terminal prompt after ~3s regardless), so a longer `timeout` here
-/// only extends how long the *keyboard* answer path stays available, never
-/// how long the user is blocked. `claude_decision::CLAUDE_PERMISSION_DECISION_TIMEOUT`
-/// is intentionally shorter than this value -- see its own doc comment.
-pub const CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS: u64 = 60;
+///
+/// Raised from an earlier 60s to 600s: `docs/claude-permission-hook-gate-results.md`
+/// §Q6 confirmed by an actual round trip that this is safe to extend --
+/// Claude Code never waits for the hook itself, it shows its own terminal
+/// prompt after ~3s regardless -- so a longer `timeout` here never makes
+/// the user wait longer. It only extends how long the *keyboard* answer
+/// path stays available, and 60s proved too short in real usage for a
+/// person to reliably notice a request and press the HUD in time.
+///
+/// What is *not* known is the largest `timeout` Claude Code's hook config
+/// will actually honor before enforcing some smaller cap of its own and
+/// closing the connection early regardless of this value -- that has never
+/// been measured. If that happens, the Host-side wait
+/// (`claude_decision::CLAUDE_PERMISSION_DECISION_TIMEOUT`, which is kept
+/// shorter than this value -- see its own doc comment) still cleans up the
+/// stale HUD entry once *it* elapses, so a request never sits on the HUD
+/// forever answerable-looking with nowhere for the answer to go -- it just
+/// means Claude Code stopped listening some time before that cleanup ran.
+pub const CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct ClaudePluginOptions {
@@ -257,13 +269,13 @@ mod tests {
         assert!(!hooks_bytes.starts_with(&[0xef, 0xbb, 0xbf]));
         let hooks: serde_json::Value = serde_json::from_slice(&hooks_bytes).unwrap();
         assert_eq!(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 1);
-        // `PermissionRequest` alone is extended to 60s so a HUD decision has
+        // `PermissionRequest` alone is extended to 600s so a HUD decision has
         // time to arrive; every other hook keeps its short, observation-only
         // timeout (see `CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS`'s doc
         // comment).
         assert_eq!(
             hooks["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
-            60
+            600
         );
         assert_eq!(
             hooks["hooks"]["PermissionDenied"][0]["hooks"][0]["timeout"],

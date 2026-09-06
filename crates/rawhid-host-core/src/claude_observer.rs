@@ -15,12 +15,12 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
 use crate::{
-    claude_decision::{ClaudePermissionGate, CLAUDE_PERMISSION_DECISION_TIMEOUT},
+    claude_decision::{ClaudePermissionGate, UnansweredReason, CLAUDE_PERMISSION_DECISION_TIMEOUT},
     claude_hook_event::{ClaudeHookEvent, ClaudeObserverEvent, ClaudeWrapperExited},
     pending_approval::claude_key,
 };
@@ -395,7 +395,12 @@ async fn handle_permission_request(
             return;
         }
     };
-    let token = claude_key(&hook.launch_id, &session_id).token().to_string();
+    // Captured now, before `event` (which `hook` borrows from) is moved into
+    // `try_send` below -- needed later for `note_unanswerable`, which wants
+    // the `(launch_id, session_id)` pair alongside the token so its caller
+    // can also withdraw the session's own approval request.
+    let launch_id = hook.launch_id.clone();
+    let token = claude_key(&launch_id, &session_id).token().to_string();
 
     // Register before queuing -- see this function's own doc comment.
     let receiver = state.permission_gate.register(token.clone());
@@ -422,25 +427,136 @@ async fn handle_permission_request(
     }
     state.counters.accepted.fetch_add(1, Ordering::Relaxed);
 
-    match tokio::time::timeout(state.permission_decision_timeout, receiver).await {
-        Ok(Ok(decision)) => {
-            state
-                .counters
-                .permission_decided
-                .fetch_add(1, Ordering::Relaxed);
-            let _ = write_json_response(stream, 200, &decision.hook_response_body()).await;
+    // Below, the decision wait (`receiver`, timeout-guarded via `sleep`) runs
+    // concurrently with a single-byte read probe on the same `stream` that
+    // is otherwise sitting idle while we wait. Two real-machine
+    // `PermissionRequest`s compared on 2026-09-06 confirmed what that probe
+    // firing actually means: a request rejected from the terminal at
+    // 14:59:22 had this connection's read side close 10.7s later, while a
+    // request left completely untouched, received at 15:02:51, still had it
+    // open three and a half minutes later. So a close here reliably means
+    // "this request was settled somewhere other than Studio" and is now
+    // this wait's own end condition -- see the probe arm's own comment below
+    // for how it decides whether that is actually true for *this*
+    // connection's own waiter before ending the wait.
+    tokio::pin!(receiver);
+    let sleep = tokio::time::sleep(state.permission_decision_timeout);
+    tokio::pin!(sleep);
+    let mut probe_byte = [0_u8; 1];
+
+    // Every arm below ends this connection, so this is one `select!` rather
+    // than a loop. In particular the read probe never "keeps waiting": a
+    // closed peer would return `Ok(0)` immediately and forever, so anything
+    // that polled it twice would spin hot.
+    //
+    // Two of the three arms have to answer the same question before acting:
+    // is this connection's own waiter still the live one for `token`? A
+    // retried `PermissionRequest` for the same session registers again under
+    // the same token (`ClaudePermissionGate::register`'s own doc comment),
+    // which drops this connection's sender and makes the *newer*
+    // registration the owner of both the gate waiter and the
+    // `PendingApprovalStore` entry. Acting on `token` after that point would
+    // reach into the newer request's state: `note_unanswerable` would delete
+    // its still-live store entry, and `cancel` would drop the waiter it is
+    // relying on to receive a HUD answer. So both arms triage with
+    // `try_recv` first, and only the `Empty` case -- still registered, still
+    // unanswered -- records or cancels anything.
+    tokio::select! {
+        decision = &mut receiver => {
+            match decision {
+                Ok(decision) => {
+                    state
+                        .counters
+                        .permission_decided
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = write_json_response(stream, 200, &decision.hook_response_body()).await;
+                }
+                // The sender was dropped without ever sending: either a
+                // later `register` for the same token replaced this waiter,
+                // or `ClaudePermissionGate::cancel`/`cancel_launch` removed
+                // it because the terminal answered first or the
+                // session/launch ended. Either way this connection's own
+                // registration is already gone, so there is nothing here to
+                // record as unanswerable and nothing of ours left to cancel
+                // -- deliberately no `cancel(&token)` call, which would
+                // otherwise drop a newer registration's waiter.
+                Err(_) => {
+                    let _ = write_response(stream, 204).await;
+                }
+            }
         }
-        // `Ok(Err(_))`: the sender was dropped, either by a later
-        // `register` for the same token (a retried request) or by
-        // `ClaudePermissionGate::cancel`/`cancel_launch` (the terminal
-        // answered first, or the session/launch ended). `Err(_)`: the
-        // decision timeout elapsed with nobody answering. Both degrade to
-        // 204 identically -- from this hook connection's perspective there
-        // is no difference between "nobody is going to answer" and "someone
-        // else already did".
-        Ok(Err(_)) | Err(_) => {
-            state.permission_gate.cancel(&token);
-            let _ = write_response(stream, 204).await;
+        () = &mut sleep => {
+            // The decision timeout elapsed. Whether that leaves anything to
+            // clean up depends on whether this connection still owns the
+            // token -- see this block's own comment above.
+            match receiver.as_mut().try_recv() {
+                // Superseded or already cancelled: not ours to touch.
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    let _ = write_response(stream, 204).await;
+                }
+                // A decision landed in the same instant the timeout fired.
+                // Deliver it rather than dropping an answer the gate
+                // believes it handed off.
+                Ok(decision) => {
+                    state
+                        .counters
+                        .permission_decided
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = write_json_response(stream, 200, &decision.hook_response_body()).await;
+                }
+                // Still the live waiter, and nobody -- neither a HUD action
+                // nor the terminal -- ever answered. Record it so Host code
+                // can drop the matching `PendingApprovalStore` entry and
+                // withdraw the session's own approval request (see
+                // `ClaudePermissionGate::note_unanswerable`'s doc comment).
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    state.permission_gate.note_unanswerable(
+                        &token,
+                        &launch_id,
+                        &session_id,
+                        UnansweredReason::DecisionTimeout,
+                    );
+                    state.permission_gate.cancel(&token);
+                    let _ = write_response(stream, 204).await;
+                }
+            }
+        }
+        read_result = stream.read(&mut probe_byte) => {
+            // `Ok(0)` (EOF), `Ok(n >= 1)` (unexpected data -- this
+            // connection is not supposed to send anything more once its
+            // request finished), and `Err(_)` (a read error, e.g. a reset)
+            // are all the same thing here: the read side of this connection
+            // ended while we were still waiting, which the 2026-09-06
+            // comparison above established means the request was settled
+            // from the terminal.
+            let _ = read_result;
+            match receiver.as_mut().try_recv() {
+                // Superseded or already cancelled: not ours to touch. No
+                // response either -- the peer closed its read side.
+                Err(oneshot::error::TryRecvError::Closed) => {}
+                // A decision landed in the same instant as the close, and
+                // this probe observed it first. Deliver it exactly as the
+                // decision arm would have.
+                Ok(decision) => {
+                    state
+                        .counters
+                        .permission_decided
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = write_json_response(stream, 200, &decision.hook_response_body()).await;
+                }
+                // Still the live, unanswered waiter. The peer that closed
+                // this connection is already gone, so there is nothing to
+                // write a response to. Record the close and stop waiting.
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    state.permission_gate.note_unanswerable(
+                        &token,
+                        &launch_id,
+                        &session_id,
+                        UnansweredReason::ConnectionClosed,
+                    );
+                    state.permission_gate.cancel(&token);
+                }
+            }
         }
     }
 }
@@ -945,6 +1061,350 @@ mod tests {
                 events.recv().await,
                 Some(ClaudeObserverEvent::Hook(_))
             ));
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// The decision-timeout branch (`Err(_)` from `tokio::time::timeout`)
+    /// must record the token as unanswerable, so Host code can withdraw the
+    /// matching `PendingApprovalStore` entry -- see
+    /// `ClaudePermissionGate::note_unanswerable`'s doc comment for why.
+    #[test]
+    fn permission_request_records_the_token_as_unanswerable_when_the_decision_timeout_elapses() {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_millis(50);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let response = reqwest::Client::new()
+                .post(&receiver.config().endpoint)
+                .bearer_auth(token)
+                .json(&permission_request_body("session-1"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+            let token_str = claude_key("launch-1", "session-1").token().to_string();
+            assert_eq!(
+                gate.drain_unanswerable(),
+                vec![crate::claude_decision::UnansweredApproval {
+                    token: token_str,
+                    launch_id: "launch-1".to_string(),
+                    session_id: "session-1".to_string(),
+                    reason: crate::claude_decision::UnansweredReason::DecisionTimeout,
+                }]
+            );
+            assert!(matches!(
+                events.recv().await,
+                Some(ClaudeObserverEvent::Hook(_))
+            ));
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// The other losing branch (`Ok(Err(_))`, a dropped sender) must NOT
+    /// record the token -- here simulated the same way
+    /// `ClaudeApprovalBodyConsumer` would when the terminal answers first
+    /// (§9.4's first-wins rule), by calling `cancel` directly while the
+    /// connection is still open and well before its own decision timeout
+    /// would fire. Recording in this branch would risk deleting a *newer*
+    /// registration's live entry on a retried request -- see the call
+    /// site's own comment in `handle_permission_request`.
+    #[test]
+    fn permission_request_does_not_record_the_token_as_unanswerable_when_cancelled_first() {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_secs(5);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let endpoint = receiver.config().endpoint.clone();
+            let request = tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(&endpoint)
+                    .bearer_auth(token)
+                    .json(&permission_request_body("session-1"))
+                    .send()
+                    .await
+                    .unwrap()
+            });
+
+            let _event = events.recv().await.unwrap();
+            let token_str = claude_key("launch-1", "session-1").token().to_string();
+            gate.cancel(&token_str);
+
+            let response = request.await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+            assert!(
+                gate.drain_unanswerable().is_empty(),
+                "cancel (terminal-first / superseded) must not be recorded as a decision timeout"
+            );
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// Polls `condition` until it is true or a bounded number of attempts
+    /// elapses, for asserting on state a background task (here, the
+    /// receiver's connection task) updates asynchronously with no other
+    /// signal to await. Never used to paper over a flaky assertion --
+    /// see its two call sites, both of which wait on a genuinely
+    /// concurrent background write.
+    async fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        condition()
+    }
+
+    /// Stage 4's connecting of the observation to a real end: a client that
+    /// closes its side of a still-waiting `PermissionRequest` connection (no
+    /// HTTP response ever read) while its waiter is still the live one for
+    /// `token` must be recorded via `note_unanswerable`'s `ConnectionClosed`
+    /// reason, and -- unlike the earlier observation-only version -- must
+    /// end the handler's wait immediately rather than merely being logged
+    /// alongside a wait that keeps running. Exercised through the real
+    /// receiver and a raw `TcpStream` (rather than `reqwest`, which does not
+    /// expose a way to close the write side without ever reading a
+    /// response). The decision timeout is set far longer than this test's
+    /// own poll budget so that a pass here can only mean the close itself
+    /// ended the wait, not a timeout that happened to also elapse.
+    #[test]
+    fn client_closing_the_connection_while_waiting_is_recorded_and_ends_the_wait() {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_secs(600);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let endpoint = receiver.config().endpoint.clone();
+            let addr = endpoint
+                .trim_start_matches("http://")
+                .trim_end_matches("/hooks")
+                .to_string();
+
+            let body = serde_json::to_vec(&permission_request_body("session-1")).unwrap();
+            let request = format!(
+                "POST /hooks HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut stream = TcpStream::connect(&addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+
+            // `handle_permission_request` registers with the gate and queues
+            // the event before it ever waits on a decision (see that
+            // function's own doc comment), so once the event is observable
+            // here, the connection is already sitting in its `select!` loop.
+            let _event = events.recv().await.unwrap();
+            // Close our side without ever reading a response -- the server's
+            // read-probe arm should see this as an EOF.
+            drop(stream);
+
+            let recorded = wait_for(|| !gate.drain_unanswerable().is_empty()).await;
+            assert!(
+                recorded,
+                "the read-probe arm must observe the client-side close and record it"
+            );
+
+            // The wait actually ended (the waiter was removed), well before
+            // the 600s decision timeout above could ever have fired on its
+            // own -- `wait_for`'s own bound (200 * 5ms = 1s) proves that.
+            assert_eq!(
+                gate.waiting_count(),
+                0,
+                "the connection close must cancel the now-dead waiter, not merely log the close"
+            );
+            // The recorded entry's exact shape -- token, launch/session pair,
+            // and `ConnectionClosed` reason -- is pinned separately by
+            // `client_closing_the_connection_while_waiting_records_the_connection_closed_reason`
+            // below. This test is only about the wait ending on the close.
+
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// Pins the exact recorded entry's shape (token, launch/session pair,
+    /// and `ConnectionClosed` reason) rather than only checking "something
+    /// was recorded" -- a regression that dropped the reason or mixed up the
+    /// token would slip past a looser assertion.
+    #[test]
+    fn client_closing_the_connection_while_waiting_records_the_connection_closed_reason() {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_secs(600);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let endpoint = receiver.config().endpoint.clone();
+            let addr = endpoint
+                .trim_start_matches("http://")
+                .trim_end_matches("/hooks")
+                .to_string();
+
+            let body = serde_json::to_vec(&permission_request_body("session-1")).unwrap();
+            let request = format!(
+                "POST /hooks HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut stream = TcpStream::connect(&addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+
+            let _event = events.recv().await.unwrap();
+            drop(stream);
+
+            let token_str = claude_key("launch-1", "session-1").token().to_string();
+            let mut recorded = Vec::new();
+            let found = wait_for(|| {
+                recorded = gate.drain_unanswerable();
+                !recorded.is_empty()
+            })
+            .await;
+            assert!(found, "the close must be recorded");
+            assert_eq!(
+                recorded,
+                vec![crate::claude_decision::UnansweredApproval {
+                    token: token_str,
+                    launch_id: "launch-1".to_string(),
+                    session_id: "session-1".to_string(),
+                    reason: crate::claude_decision::UnansweredReason::ConnectionClosed,
+                }]
+            );
+
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// Once a connection close has ended the wait, the waiter is gone for
+    /// good -- unlike the pre-stage-4 observation-only behavior, a decision
+    /// arriving afterward for the same token no longer has anyone to deliver
+    /// it to. This pins that the cleanup is real (`cancel`, not just a log
+    /// line): `gate.answer` returns `false` because nothing is registered
+    /// any more.
+    #[test]
+    fn a_decision_arriving_after_the_connection_close_finds_no_waiter() {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_secs(600);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let endpoint = receiver.config().endpoint.clone();
+            let addr = endpoint
+                .trim_start_matches("http://")
+                .trim_end_matches("/hooks")
+                .to_string();
+
+            let body = serde_json::to_vec(&permission_request_body("session-1")).unwrap();
+            let request = format!(
+                "POST /hooks HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut stream = TcpStream::connect(&addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+
+            let _event = events.recv().await.unwrap();
+            drop(stream);
+
+            let token_str = claude_key("launch-1", "session-1").token().to_string();
+            assert!(
+                wait_for(|| !gate.drain_unanswerable().is_empty()).await,
+                "the close must be recorded before we proceed"
+            );
+
+            assert!(
+                !gate.answer(&token_str, ClaudeDecision::Allow),
+                "the waiter was already removed by the connection-close cleanup"
+            );
+            assert_eq!(receiver.counters().permission_decided, 0);
+
+            receiver.shutdown().await.unwrap();
+        });
+    }
+
+    /// The hazard the read-probe's `try_recv` guards against: a retried
+    /// `PermissionRequest` for the same session registers a *new* waiter for
+    /// the same token, replacing the first connection's. That first
+    /// connection's own eventual close (or its decision-arm `Err(_)` losing
+    /// branch, whichever the scheduler happens to observe first -- both
+    /// share the same "do not record" contract) must never record an
+    /// unanswerable entry for a token that a newer, still-live registration
+    /// now owns; doing so would let the HUD's live offer for the *new*
+    /// request disappear out from under it.
+    #[test]
+    fn a_retried_request_superseding_an_older_connections_waiter_never_records_it_as_unanswerable()
+    {
+        runtime().block_on(async {
+            let token = "0123456789abcdef0123456789abcdef";
+            let gate = Arc::new(ClaudePermissionGate::default());
+            let mut options = ClaudeObserverReceiverOptions::loopback("launch-1", token);
+            options.permission_gate = gate.clone();
+            options.permission_decision_timeout = Duration::from_secs(600);
+            let (receiver, mut events) = ClaudeObserverReceiver::bind(options).await.unwrap();
+            let endpoint = receiver.config().endpoint.clone();
+
+            let client = reqwest::Client::new();
+            let first_endpoint = endpoint.clone();
+            let first_request = tokio::spawn(async move {
+                client
+                    .post(&first_endpoint)
+                    .bearer_auth(token)
+                    .json(&permission_request_body("session-1"))
+                    .send()
+                    .await
+                    .unwrap()
+            });
+            let _first_event = events.recv().await.unwrap();
+
+            // The retry: same launch/session, a brand-new connection. Its
+            // internal `register` call replaces the first connection's
+            // waiter, dropping that first connection's sender.
+            let second_client = reqwest::Client::new();
+            let second_endpoint = endpoint.clone();
+            let second_request = tokio::spawn(async move {
+                second_client
+                    .post(&second_endpoint)
+                    .bearer_auth(token)
+                    .json(&permission_request_body("session-1"))
+                    .send()
+                    .await
+                    .unwrap()
+            });
+            let _second_event = events.recv().await.unwrap();
+
+            // The first connection has nothing left to win with -- it
+            // degrades on its own (either the decision arm's dropped-sender
+            // branch, or the read-probe's `Closed` branch if this test's own
+            // client closing its socket happens to race ahead of that;
+            // either is an acceptable outcome here).
+            let first_response = first_request.await.unwrap();
+            assert_eq!(first_response.status(), reqwest::StatusCode::NO_CONTENT);
+
+            // Whichever branch handled it, nothing must have been recorded
+            // as unanswerable for this token.
+            assert!(
+                gate.drain_unanswerable().is_empty(),
+                "a superseded connection's own end must never record the token \
+                 a newer registration now owns"
+            );
+
+            // And the new registration must still be fully answerable.
+            let token_str = claude_key("launch-1", "session-1").token().to_string();
+            assert!(gate.answer(&token_str, ClaudeDecision::Allow));
+            let second_response = second_request.await.unwrap();
+            assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+            assert_eq!(receiver.counters().permission_decided, 1);
+
             receiver.shutdown().await.unwrap();
         });
     }

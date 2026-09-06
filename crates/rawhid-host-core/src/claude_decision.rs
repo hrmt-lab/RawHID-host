@@ -36,16 +36,34 @@ use crate::pending_approval::claude_launch_token_prefix;
 /// before giving up and letting the hook connection fall back to 204.
 ///
 /// This is deliberately shorter than
-/// `claude_hooks::CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS` (60s): Claude
-/// Code itself does not wait for the hook at all -- it shows its own
-/// terminal prompt after about three seconds regardless
-/// (`docs/claude-permission-hook-gate-results.md` §Q1) -- so there is no
-/// benefit to the Host holding the connection open for the hook's own
-/// timeout. Finishing a few seconds early instead means the *Host*, not
-/// Claude Code's HTTP client, is what decides the hook connection closes,
-/// which keeps the 204 fallback path exercised (and testable) under Host
-/// control rather than racing an external timeout.
-pub const CLAUDE_PERMISSION_DECISION_TIMEOUT: Duration = Duration::from_secs(55);
+/// `claude_hooks::CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS` (600s) -- kept
+/// that way on purpose, see this module's tests -- and was raised from an
+/// earlier 55s alongside that value going from 60s to 600s. Extending it is
+/// safe for the same reason extending the hook's own `timeout` is safe
+/// (`docs/claude-permission-hook-gate-results.md` §Q6, confirmed by an
+/// actual round trip): Claude Code does not wait for the hook at all -- it
+/// shows its own terminal prompt after about three seconds regardless -- so
+/// a longer wait here never makes the user wait longer. It only extends how
+/// long the *keyboard* answer path stays reachable, which is the entire
+/// point: at 55s, a person had to notice and press the HUD within about a
+/// minute of the request appearing, which real usage showed was routinely
+/// missed.
+///
+/// What is *not* known is how large a `timeout` Claude Code's own hook
+/// config will actually honor -- that upper bound has never been measured.
+/// If Claude Code enforces some smaller cap of its own and closes the hook
+/// connection early, this Host-side wait simply keeps running past that
+/// point for nothing: the hook is already gone, so nothing this gate does
+/// can reach Claude Code for that request any more. That failure mode is
+/// exactly what `ClaudePermissionGate::note_unanswerable` /
+/// `drain_unanswerable` exist to contain -- once this wait's own timeout
+/// (595s) elapses with nobody having answered, the token is recorded and
+/// the Host drops the matching `PendingApprovalStore` entry, so the HUD
+/// stops offering a request it can no longer deliver an answer for, even
+/// though Claude Code stopped listening earlier. The real cap, if any, can
+/// be found by leaving a request unanswered and then answering it from the
+/// HUD anyway, reading the resulting `answered=` diagnostic.
+pub const CLAUDE_PERMISSION_DECISION_TIMEOUT: Duration = Duration::from_secs(595);
 
 /// One decision for a Claude Code `PermissionRequest` hook, already
 /// resolved to a `behavior` (never the raw opaque string from
@@ -169,6 +187,83 @@ impl ClaudeDecision {
 #[derive(Default)]
 pub struct ClaudePermissionGate {
     waiters: Mutex<HashMap<String, oneshot::Sender<ClaudeDecision>>>,
+    /// Entries whose waiter ended with nobody ever answering -- either the
+    /// decision wait itself timed out, or the hook connection's read side
+    /// closed while the waiter was still live. See [`UnansweredReason`] for
+    /// the two cases; `claude_observer.rs`'s `handle_permission_request` is
+    /// the only caller of [`Self::note_unanswerable`], recording one of these
+    /// exactly when its own wait on [`Self::register`]'s receiver ends that
+    /// way (see that call site's comments on why this must never happen for
+    /// the other losing branch, a dropped sender).
+    ///
+    /// A token landing here means the Host can no longer deliver a decision
+    /// for it at all -- the hook connection it belonged to already closed
+    /// itself (either just now, or once its 204 fallback was written). The
+    /// HUD must not keep offering a request as "answerable" once that has
+    /// happened, or a press just disappears with no effect (the real-machine
+    /// symptom this exists to fix). Host code (`rawhid-host-tauri`'s
+    /// `commands.rs`) drains this list every tick and uses it to drop the
+    /// matching entry from `PendingApprovalStore`, and (via
+    /// `claude_activity::ClaudeSessionRegistry::withdraw_approval_requests`)
+    /// to withdraw the matching session's own unresolved approval request --
+    /// see that method's doc comment for why the session side must also give
+    /// up, not just the HUD offer.
+    unanswerable: Mutex<Vec<UnansweredApproval>>,
+}
+
+/// Why a [`ClaudePermissionGate`] waiter ended up in
+/// [`ClaudePermissionGate::drain_unanswerable`] without ever receiving a
+/// decision. `commands.rs` logs this (via [`Self::diagnostic_label`]) but
+/// applies the exact same cleanup regardless of which one it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnansweredReason {
+    /// Nobody -- neither a HUD action nor the terminal -- answered before
+    /// [`CLAUDE_PERMISSION_DECISION_TIMEOUT`] elapsed. The Host still cannot
+    /// tell, at this point, whether the request is genuinely abandoned or was
+    /// answered somewhere Studio can no longer observe -- see
+    /// `claude_activity::ClaudeStateChangeReason::ApprovalWithdrawn`'s doc
+    /// comment for the tradeoff withdrawing the HUD's offer here accepts.
+    DecisionTimeout,
+    /// The hook connection's read side observed an EOF or error while its
+    /// waiter was still live and unanswered. Confirmed against a real Claude
+    /// Code instance on 2026-09-06, comparing two otherwise identical
+    /// `PermissionRequest`s: one rejected from the terminal at 14:59:22 had
+    /// its connection close 10.7s later; one left completely untouched,
+    /// received at 15:02:51, still had its connection open three and a half
+    /// minutes later with nothing recorded. A close is therefore treated as
+    /// "this request was settled somewhere other than Studio" -- almost
+    /// always the terminal, and almost always within a second or two of the
+    /// person actually answering it there -- not a fluke of some intermediary
+    /// closing and reopening the socket.
+    ConnectionClosed,
+}
+
+impl UnansweredReason {
+    /// Diagnostic label for `commands.rs`'s `reason=` log field. Kept as its
+    /// own method (rather than relying on `Debug`) so that field's wire
+    /// string stays stable even if the variant names above change for
+    /// unrelated reasons.
+    pub fn diagnostic_label(&self) -> &'static str {
+        match self {
+            UnansweredReason::DecisionTimeout => "decision_timeout",
+            UnansweredReason::ConnectionClosed => "connection_closed",
+        }
+    }
+}
+
+/// One token [`ClaudePermissionGate::note_unanswerable`] recorded, together
+/// with the `(launch_id, session_id)` pair the hook connection belonged to
+/// and why it ended up here. `commands.rs`'s `drain_claude_state_changes`
+/// needs the token to withdraw the matching `PendingApprovalStore` entry, the
+/// launch/session pair to withdraw the matching session's own approval
+/// request via `claude_activity::ClaudeSessionRegistry::withdraw_approval_requests`,
+/// and the reason purely for its diagnostic log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnansweredApproval {
+    pub token: String,
+    pub launch_id: String,
+    pub session_id: String,
+    pub reason: UnansweredReason,
 }
 
 impl std::fmt::Debug for ClaudePermissionGate {
@@ -240,6 +335,40 @@ impl ClaudePermissionGate {
     /// Diagnostics/tests only.
     pub fn waiting_count(&self) -> usize {
         self.waiters.lock().unwrap().len()
+    }
+
+    /// Records that `token`'s waiter ended with nobody answering, for
+    /// `reason`, so a later [`Self::drain_unanswerable`] call can pick it up.
+    /// See the `unanswerable` field's own doc comment for why this exists and
+    /// who is expected to call it (only `claude_observer.rs`'s
+    /// decision-timeout arm and its read-probe arm's live-waiter case --
+    /// never the dropped-sender branch). `launch_id`/`session_id` are the
+    /// same pair `token` was built from (`pending_approval.rs`'s
+    /// `claude_key`); they are carried alongside the token purely so the
+    /// caller can also withdraw the session's own approval request without
+    /// having to parse either back out of the opaque token string.
+    pub fn note_unanswerable(
+        &self,
+        token: &str,
+        launch_id: &str,
+        session_id: &str,
+        reason: UnansweredReason,
+    ) {
+        self.unanswerable.lock().unwrap().push(UnansweredApproval {
+            token: token.to_string(),
+            launch_id: launch_id.to_string(),
+            session_id: session_id.to_string(),
+            reason,
+        });
+    }
+
+    /// Takes every entry recorded by [`Self::note_unanswerable`] since the
+    /// last call, leaving the list empty. Host code calls this once per
+    /// tick to reconcile `PendingApprovalStore` (and the matching session's
+    /// own approval request) with requests the gate can no longer deliver a
+    /// decision for.
+    pub fn drain_unanswerable(&self) -> Vec<UnansweredApproval> {
+        std::mem::take(&mut self.unanswerable.lock().unwrap())
     }
 }
 
@@ -445,5 +574,71 @@ mod tests {
         crate::pending_approval::claude_key(launch_id, session_id)
             .token()
             .to_string()
+    }
+
+    /// Pins the relationship documented on both constants: the Host's own
+    /// wait must always give up strictly before the hook's `timeout` would,
+    /// so it is the Host -- not Claude Code's HTTP client -- that decides
+    /// when a `PermissionRequest` connection falls back to 204. Changing
+    /// either constant without keeping this true would silently invert
+    /// which side controls that fallback.
+    #[test]
+    fn decision_timeout_stays_shorter_than_the_hook_timeout() {
+        assert!(
+            CLAUDE_PERMISSION_DECISION_TIMEOUT
+                < Duration::from_secs(crate::claude_hooks::CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS),
+            "the Host's decision wait must stay shorter than the hook's own timeout"
+        );
+    }
+
+    #[test]
+    fn drain_unanswerable_returns_recorded_entries_and_then_empties() {
+        let gate = ClaudePermissionGate::default();
+        gate.note_unanswerable(
+            "token-a",
+            "launch-1",
+            "session-1",
+            UnansweredReason::DecisionTimeout,
+        );
+        gate.note_unanswerable(
+            "token-b",
+            "launch-2",
+            "session-2",
+            UnansweredReason::ConnectionClosed,
+        );
+
+        assert_eq!(
+            gate.drain_unanswerable(),
+            vec![
+                UnansweredApproval {
+                    token: "token-a".to_string(),
+                    launch_id: "launch-1".to_string(),
+                    session_id: "session-1".to_string(),
+                    reason: UnansweredReason::DecisionTimeout,
+                },
+                UnansweredApproval {
+                    token: "token-b".to_string(),
+                    launch_id: "launch-2".to_string(),
+                    session_id: "session-2".to_string(),
+                    reason: UnansweredReason::ConnectionClosed,
+                },
+            ]
+        );
+        assert!(
+            gate.drain_unanswerable().is_empty(),
+            "a second drain must find nothing left"
+        );
+    }
+
+    #[test]
+    fn unanswered_reason_diagnostic_label_matches_the_expected_wire_string() {
+        assert_eq!(
+            UnansweredReason::DecisionTimeout.diagnostic_label(),
+            "decision_timeout"
+        );
+        assert_eq!(
+            UnansweredReason::ConnectionClosed.diagnostic_label(),
+            "connection_closed"
+        );
     }
 }

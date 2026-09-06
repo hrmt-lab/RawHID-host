@@ -18,6 +18,7 @@ use rawhid_host_core::{
     ai_usage::{AiUsageRefreshError, AiUsageRuntime, AiUsageShared},
     claude_activity::{ClaudeApprovalBodyConsumer, ClaudeSessionSnapshot, ClaudeStateChange},
     claude_decision::ClaudePermissionGate,
+    claude_hook_event::ClaudeObserverEvent,
     claude_hooks::{write_claude_observer_plugin, ClaudePluginOptions},
     claude_observer::{ClaudeObserverReceiver, ClaudeObserverReceiverOptions},
     codex_activity::{
@@ -39,7 +40,7 @@ use rawhid_host_core::{
         EncoderBindingFlags, EncoderBindingSource, EncoderGetBindings, EncoderGetInfo,
         UplinkPacket, CAPABILITY_AI_CLIENT_DISPLAY_SLOT,
     },
-    pending_approval::PendingApprovalStore,
+    pending_approval::{ApprovalKey, PendingApprovalStore},
     runner::{uplink_device_key, RunEvent, Runner},
     stats::{KeyStatsSummary, SharedKeyStatsStore, StatsPeriod},
     studio::{
@@ -4648,7 +4649,35 @@ fn drain_claude_state_changes(
     let approval_consumer = ClaudeApprovalBodyConsumer;
     for launch in integration.launches.values_mut() {
         while let Ok(event) = launch.events.try_recv() {
+            // Diagnostic only: this exists to tell apart two failure modes
+            // behind "terminal answered deny but the HUD never went away" --
+            // (a) the hook never arrived at all, versus (b) it arrived but
+            // didn't meet `ClaudeApprovalBodyConsumer::ingest`'s withdrawal
+            // condition (e.g. no `session_id`, which it silently drops). The
+            // before/after pending count says whether this event actually
+            // withdrew anything. Same restraint as `claude approval decision
+            // dispatched` above: only the protocol event name, a presence
+            // boolean, and counts -- never the hook body, tool_use_id,
+            // session_id/launch_id, or approval content.
+            let name = match &event {
+                ClaudeObserverEvent::Hook(hook) => hook.hook_event_name.as_str(),
+                ClaudeObserverEvent::WrapperExited(_) => "WrapperExited",
+            };
+            let has_session_id = matches!(
+                &event,
+                ClaudeObserverEvent::Hook(hook) if hook.session_id.is_some()
+            );
+            let pending_before = pending_approvals.len();
             approval_consumer.ingest(pending_approvals, permission_gate, &event);
+            let pending_after = pending_approvals.len();
+            tracing::debug!(
+                target: AI_DISPLAY_LOG_TARGET,
+                name,
+                has_session_id,
+                pending_before,
+                pending_after,
+                "claude hook observed"
+            );
             if let Ok(mut changes) = integration.registry.apply(event, now) {
                 claude_changes.append(&mut changes);
             }
@@ -4663,6 +4692,53 @@ fn drain_claude_state_changes(
         launch.last_counters = counters;
     }
     claude_changes.extend(integration.registry.tick(now));
+    // A `PermissionRequest` hook connection stops being answerable in one of
+    // two ways, both reported here by
+    // `ClaudePermissionGate::drain_unanswerable` (see `UnansweredReason`):
+    // Claude Code closed the connection because the request was settled from
+    // the terminal, or the Host's own decision wait
+    // (`claude_decision::CLAUDE_PERMISSION_DECISION_TIMEOUT`) elapsed with
+    // nobody answering anywhere. Left alone, either one leaves the HUD
+    // showing a request as something it can still answer -- pressing a key
+    // just does nothing, because the hook connection it would have answered
+    // is already gone. This withdraws the HUD's offer to answer it.
+    //
+    // It also withdraws the session's own approval request via
+    // `withdraw_approval_requests`, which stops the ScreenKey's yellow
+    // blink. What the session falls back to depends on the reason, so that
+    // method takes it: a closed connection ends the turn (the request was
+    // answered on the terminal and Claude Code is idle again), while a
+    // timeout only drops the request and recomputes, since Studio genuinely
+    // does not know the outcome there. See that method's own doc comment.
+    //
+    // Both paths are otherwise the same cleanup, so they run through one
+    // loop and differ in the diagnostic `reason=`.
+    for unanswered in permission_gate.drain_unanswerable() {
+        let reason = unanswered.reason.diagnostic_label();
+        let key = ApprovalKey::new(unanswered.token);
+        let pending_before = pending_approvals.len();
+        pending_approvals.resolve(&key);
+        let pending_after = pending_approvals.len();
+        let session_changes = integration.registry.withdraw_approval_requests(
+            &unanswered.launch_id,
+            &unanswered.session_id,
+            unanswered.reason,
+            now,
+        );
+        let session_withdrawn = !session_changes.is_empty();
+        let session_changes_count = session_changes.len();
+        claude_changes.extend(session_changes);
+        tracing::debug!(
+            target: AI_DISPLAY_LOG_TARGET,
+            reason,
+            removed = pending_after < pending_before,
+            pending_after,
+            session_withdrawn,
+            session_changes_count,
+            "claude approval offer withdrawn"
+        );
+    }
+
     let terminal_targets = integration
         .launches
         .iter()

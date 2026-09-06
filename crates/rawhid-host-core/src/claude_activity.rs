@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
-    claude_decision::ClaudePermissionGate,
+    claude_decision::{ClaudePermissionGate, UnansweredReason},
     claude_hook_event::{ClaudeHookEvent, ClaudeObserverEvent},
     next_ai_session_registration_order,
     packet::{AiActivityState, AiWorkPhase},
@@ -40,6 +40,18 @@ pub enum ClaudeStateChangeReason {
     Desynchronized,
     SessionEnded,
     WrapperExited,
+    /// [`ClaudeSessionRegistry::withdraw_approval_requests`] withdrew this
+    /// session's unresolved approval request: either Claude Code closed the
+    /// hook connection because the request was answered from its own
+    /// terminal prompt, or the Host's decision wait
+    /// (`claude_decision::CLAUDE_PERMISSION_DECISION_TIMEOUT`) elapsed with
+    /// nobody having answered *through Studio*. See that method's own doc
+    /// comment for how much Studio knows in each case and the real-machine
+    /// observations behind both. Kept distinct from every other reason above
+    /// so logs and any future decision logic can tell "this request was
+    /// settled somewhere Studio cannot observe" apart from every other
+    /// transition.
+    ApprovalWithdrawn,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -466,6 +478,69 @@ impl ClaudeSessionRegistry {
             .flat_map(|(_, reducer)| reducer.mark_desynchronized())
             .collect()
     }
+    /// Withdraws only the approval (`RequestKind::Approval`) request held by
+    /// the session identified by `(launch_id, session_id)`, if any, and
+    /// recomputes that session's display state the same way every other
+    /// request-driven transition does (`waiting_or_working()` /
+    /// `active_phase()` -- never a hardcoded `Working`).
+    ///
+    /// Call this exactly when `claude_decision::ClaudePermissionGate`
+    /// reports a token as unanswerable (`drain_unanswerable`). Its
+    /// `UnansweredReason` says which of the two cases it is, and they differ
+    /// in how much Studio actually knows:
+    ///
+    /// - `ConnectionClosed` -- the usual case, and the reason this exists at
+    ///   all. Claude Code closed the hook connection because the request was
+    ///   settled from its own terminal prompt, and every close observed so
+    ///   far was a *rejection*: an accepted request keeps the connection
+    ///   open, runs the tool, and cleans up through the ordinary
+    ///   `PostToolUse`/`PostToolBatch`/`Stop` hooks without ever reaching
+    ///   here. Two real `PermissionRequest`s compared on 2026-09-06
+    ///   established what a close means at all: one rejected from the
+    ///   terminal had its connection close 10.7s later, while one left
+    ///   untouched still had it open three and a half minutes on. So this
+    ///   case ends the turn and reports `Available` -- after a rejection
+    ///   Claude Code sits idle at its prompt, and anything else would spin a
+    ///   "working" display for a session that is doing nothing (also seen on
+    ///   real hardware that day, before this distinction existed).
+    /// - `DecisionTimeout` -- nobody answered anywhere before the Host's own
+    ///   decision wait (`CLAUDE_PERMISSION_DECISION_TIMEOUT`, 595s) ran out.
+    ///   Here Studio genuinely does not know the outcome. It cannot even
+    ///   tell "still pending" from "already resolved": the same 2026-09-06
+    ///   session showed that after a terminal rejection no
+    ///   `PermissionDenied`, `PostToolUse`, or `Stop` hook arrives at all --
+    ///   for six minutes the Host's own timeout was the only thing that
+    ///   fired. Continuing to display `WaitingApproval` would state a
+    ///   certainty Studio no longer has, so this falls back to the same
+    ///   general "still working" state the detail-stale rule
+    ///   (`ClaudeSessionReducer::tick`'s `DetailStale` branch) already uses
+    ///   when it loses track of a session's fine-grained detail.
+    ///
+    /// The tradeoff the `DecisionTimeout` case accepts: if the request
+    /// genuinely is still pending ten minutes on with nobody having answered
+    /// it anywhere, the yellow "please answer me" signal this call removes
+    /// will not come back on its own -- there is no event left that would
+    /// put it back.
+    ///
+    /// Only a request of kind `RequestKind::Approval` is removed; an
+    /// elicitation (`RequestKind::Input`) held by the same session is left
+    /// untouched, since this gate only ever gates `PermissionRequest`
+    /// connections. Returns an empty `Vec` -- no state change -- when there
+    /// is no reducer for `(launch_id, session_id)`, that session is not
+    /// `session_active`, or it holds no approval request to withdraw.
+    pub fn withdraw_approval_requests(
+        &mut self,
+        launch_id: &str,
+        session_id: &str,
+        reason: UnansweredReason,
+        now: Instant,
+    ) -> Vec<ClaudeStateChange> {
+        let key = (launch_id.to_string(), session_id.to_string());
+        let Some(reducer) = self.sessions.get_mut(&key) else {
+            return Vec::new();
+        };
+        reducer.withdraw_approval_requests(reason, now)
+    }
 
     pub fn snapshots(&self) -> Vec<ClaudeSessionSnapshot> {
         self.order
@@ -550,6 +625,28 @@ impl ClaudeSessionReducer {
         if !self.snapshot.session_active || !self.turn_active {
             return Vec::new();
         }
+        // An unresolved request (a pending approval or elicitation) means
+        // Claude Code is waiting on a human to answer -- silence for
+        // minutes is the expected, correct state here, not evidence that
+        // this reducer lost track of what the session is doing. The
+        // detail-stale rule below exists to fall back to a safe `Working`
+        // display when we genuinely *don't* know what a session is doing;
+        // an outstanding request is proof of the opposite, since
+        // `waiting_or_working()` derives `WaitingApproval` / `WaitingInput`
+        // from `requests` being non-empty in the first place. So gate on
+        // the cause (`requests`), not the resulting activity state.
+        //
+        // Observed on real hardware on 2026-09-06: a session sitting in
+        // `WaitingApproval` for ~120s (no human answer yet) silently
+        // flipped its ScreenKey display to `Working` even though the HUD
+        // and the terminal were both still waiting on the approval, which
+        // also made ScreenKey stop offering that session as a HUD
+        // selection target. Once the request resolves, `RequestResolve`
+        // above refreshes `last_relevant_event`, so the stale timer
+        // naturally restarts counting from that point.
+        if !self.requests.is_empty() {
+            return Vec::new();
+        }
         let Some(last_event) = self.last_relevant_event else {
             return Vec::new();
         };
@@ -587,6 +684,75 @@ impl ClaudeSessionReducer {
             AiWorkPhase::Unspecified,
             ClaudeStateChangeReason::Desynchronized,
         )]
+    }
+
+    /// Reducer half of [`ClaudeSessionRegistry::withdraw_approval_requests`]
+    /// -- see that method's doc comment for the full reasoning. Removes only
+    /// `RequestKind::Approval` entries from `requests`, leaving any
+    /// `RequestKind::Input` (elicitation) entry untouched, then re-derives
+    /// the display state exactly like every other request-driven transition
+    /// in this reducer (`waiting_or_working()` / `active_phase()`).
+    fn withdraw_approval_requests(
+        &mut self,
+        reason: UnansweredReason,
+        now: Instant,
+    ) -> Vec<ClaudeStateChange> {
+        if !self.snapshot.session_active {
+            return Vec::new();
+        }
+        let had_approval = self
+            .requests
+            .values()
+            .any(|kind| *kind == RequestKind::Approval);
+        if !had_approval {
+            return Vec::new();
+        }
+        match reason {
+            // The hook connection closed, which on real hardware means the
+            // request was settled from Claude Code's own terminal prompt --
+            // and, as far as 2026-09-06's observations go, settled by
+            // *rejecting* it. An accepted request behaves differently: the
+            // connection stays open, the tool runs, and the ordinary
+            // `PostToolUse`/`PostToolBatch`/`Stop` hooks arrive at the end
+            // and clean up through the normal path, never reaching here. A
+            // rejected one sends nothing at all afterwards and leaves Claude
+            // Code sitting idle at its prompt waiting for the user to type.
+            //
+            // So end the turn: without this the session keeps the tool that
+            // asked for permission in `active_items`, `active_phase()` keeps
+            // reporting `Executing`, and the ScreenKey shows a spinning
+            // "working" state for a session that is actually idle -- exactly
+            // what the display exists to not do. `finish_turn` tombstones
+            // that never-completed tool the same way a real turn end would.
+            //
+            // If a future Claude Code ever does close the connection on an
+            // *accepted* request, the failure mode is self-correcting rather
+            // than sticky: the session reads as idle while the tool runs,
+            // and the tool's own completion hooks put it right.
+            UnansweredReason::ConnectionClosed => {
+                self.finish_turn(now);
+                vec![self.emit(
+                    AiActivityState::Available,
+                    AiWorkPhase::Unspecified,
+                    ClaudeStateChangeReason::ApprovalWithdrawn,
+                )]
+            }
+            // Nobody answered anywhere and the Host's own wait ran out. The
+            // request may well still be sitting on the terminal prompt, so
+            // the turn is *not* assumed to be over -- only the approval
+            // request itself is dropped, and the state falls back to
+            // whatever the session's remaining requests say (see this
+            // method's public wrapper for the full reasoning).
+            UnansweredReason::DecisionTimeout => {
+                self.requests
+                    .retain(|_, kind| *kind != RequestKind::Approval);
+                vec![self.emit(
+                    self.waiting_or_working(),
+                    self.active_phase(),
+                    ClaudeStateChangeReason::ApprovalWithdrawn,
+                )]
+            }
+        }
     }
 
     fn matches_event(&self, event: &ClaudeObserverEvent) -> bool {
@@ -978,6 +1144,135 @@ mod tests {
         assert_eq!(changes[0].state.activity_state, AiActivityState::Working);
         assert_eq!(changes[0].state.work_phase, AiWorkPhase::Unspecified);
         assert!(changes[0].state.session_active);
+    }
+
+    #[test]
+    fn waiting_approval_does_not_go_stale_past_the_timeout() {
+        // Regression for the 2026-09-06 hardware observation: a session
+        // sitting in `WaitingApproval` must not fall back to `Working` just
+        // because the detail-stale timeout elapsed. No human answer yet is
+        // the expected state here, not a sign we lost track of the session.
+        let now = Instant::now();
+        let mut reducer = reducer();
+        start_session(&mut reducer, now);
+        reducer
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        reducer
+            .apply(
+                hook(
+                    "PreToolUse",
+                    serde_json::json!({"tool_use_id": "tool-a", "tool_name": "Bash"}),
+                ),
+                now,
+            )
+            .unwrap();
+        let waiting = reducer
+            .apply(
+                hook(
+                    "PermissionRequest",
+                    serde_json::json!({"tool_use_id": "tool-a"}),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting[0].state.activity_state,
+            AiActivityState::WaitingApproval
+        );
+
+        assert!(reducer
+            .tick(now + CLAUDE_DETAIL_STALE_TIMEOUT + Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(
+            reducer.snapshot().activity_state,
+            AiActivityState::WaitingApproval
+        );
+    }
+
+    #[test]
+    fn waiting_input_does_not_go_stale_past_the_timeout() {
+        // Same guard as `waiting_approval_does_not_go_stale_past_the_timeout`,
+        // but for an elicitation (Claude Code asking a free-form question)
+        // instead of a tool permission request.
+        let now = Instant::now();
+        let mut reducer = reducer();
+        start_session(&mut reducer, now);
+        reducer
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        let waiting = reducer
+            .apply(
+                hook(
+                    "Elicitation",
+                    serde_json::json!({"elicitation_id": "elicit-1"}),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting[0].state.activity_state,
+            AiActivityState::WaitingInput
+        );
+
+        assert!(reducer
+            .tick(now + CLAUDE_DETAIL_STALE_TIMEOUT + Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(
+            reducer.snapshot().activity_state,
+            AiActivityState::WaitingInput
+        );
+    }
+
+    #[test]
+    fn stale_resumes_counting_after_a_request_resolves() {
+        // Once the pending request is resolved, `RequestResolve` refreshes
+        // `last_relevant_event`, so a subsequent silence of
+        // `CLAUDE_DETAIL_STALE_TIMEOUT` must still fall back to `Working` as
+        // before -- the request-based guard above must not suppress the
+        // stale rule forever, only while a request is outstanding.
+        let now = Instant::now();
+        let mut reducer = reducer();
+        start_session(&mut reducer, now);
+        reducer
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        reducer
+            .apply(
+                hook(
+                    "PreToolUse",
+                    serde_json::json!({"tool_use_id": "tool-a", "tool_name": "Bash"}),
+                ),
+                now,
+            )
+            .unwrap();
+        reducer
+            .apply(
+                hook(
+                    "PermissionRequest",
+                    serde_json::json!({"tool_use_id": "tool-a"}),
+                ),
+                now,
+            )
+            .unwrap();
+        let resolved = reducer
+            .apply(
+                hook("PostToolUse", serde_json::json!({"tool_use_id": "tool-a"})),
+                now + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(resolved[0].state.activity_state, AiActivityState::Working);
+
+        assert!(reducer
+            .tick(
+                now + Duration::from_secs(5) + CLAUDE_DETAIL_STALE_TIMEOUT
+                    - Duration::from_millis(1)
+            )
+            .is_empty());
+        let changes = reducer.tick(now + Duration::from_secs(5) + CLAUDE_DETAIL_STALE_TIMEOUT);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].reason, ClaudeStateChangeReason::DetailStale);
+        assert_eq!(changes[0].state.activity_state, AiActivityState::Working);
     }
 
     #[test]
@@ -1525,6 +1820,201 @@ mod tests {
         assert!(registry
             .mark_launch_desynchronized("other-launch")
             .is_empty());
+    }
+
+    /// Pins `withdraw_approval_requests`'s core contract: a session sitting
+    /// in `WaitingApproval` (nothing else outstanding) falls back to the
+    /// general `Working` state -- see that method's own doc comment for why
+    /// this is the intended fallback rather than, say, `Available`.
+    #[test]
+    fn withdraw_approval_requests_falls_back_to_working_on_a_decision_timeout() {
+        let now = Instant::now();
+        let mut registry = ClaudeSessionRegistry::new();
+        registry
+            .apply(hook("SessionStart", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        let waiting = registry
+            .apply(
+                hook(
+                    "PermissionRequest",
+                    serde_json::json!({"tool_use_id": "tool-a"}),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting[0].state.activity_state,
+            AiActivityState::WaitingApproval
+        );
+
+        let changes = registry.withdraw_approval_requests(
+            "launch-1",
+            "session-1",
+            UnansweredReason::DecisionTimeout,
+            now,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].reason,
+            ClaudeStateChangeReason::ApprovalWithdrawn
+        );
+        assert_eq!(changes[0].state.activity_state, AiActivityState::Working);
+        assert!(changes[0].state.session_active);
+    }
+
+    /// The `ConnectionClosed` case must end the turn instead of falling back
+    /// to `Working`. On real hardware a closed hook connection means the
+    /// request was rejected from Claude Code's own terminal prompt, after
+    /// which it sits idle waiting for the user to type. Without ending the
+    /// turn, the tool that asked for permission stays in `active_items`,
+    /// `active_phase()` keeps reporting `Executing`, and the ScreenKey spins
+    /// a "working" animation for an idle session -- observed on real
+    /// hardware on 2026-09-06.
+    #[test]
+    fn withdraw_approval_requests_ends_the_turn_when_the_connection_closed() {
+        let now = Instant::now();
+        let mut registry = ClaudeSessionRegistry::new();
+        registry
+            .apply(hook("SessionStart", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(
+                hook(
+                    "PreToolUse",
+                    serde_json::json!({"tool_use_id": "tool-a", "tool_name": "Bash"}),
+                ),
+                now,
+            )
+            .unwrap();
+        let waiting = registry
+            .apply(
+                hook(
+                    "PermissionRequest",
+                    serde_json::json!({"tool_use_id": "tool-a"}),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting[0].state.activity_state,
+            AiActivityState::WaitingApproval
+        );
+
+        let changes = registry.withdraw_approval_requests(
+            "launch-1",
+            "session-1",
+            UnansweredReason::ConnectionClosed,
+            now,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].reason,
+            ClaudeStateChangeReason::ApprovalWithdrawn
+        );
+        assert_eq!(changes[0].state.activity_state, AiActivityState::Available);
+        assert_eq!(changes[0].state.work_phase, AiWorkPhase::Unspecified);
+
+        // The turn really ended: the never-completed tool is gone, so no
+        // later tick can resurrect an `Executing` phase for it.
+        assert!(registry
+            .tick(now + CLAUDE_DETAIL_STALE_TIMEOUT + Duration::from_secs(1))
+            .is_empty());
+    }
+
+    /// A still-outstanding elicitation (`RequestKind::Input`) must survive
+    /// an approval withdrawal untouched -- this gate only ever gates
+    /// `PermissionRequest` connections, never `Elicitation`.
+    #[test]
+    fn withdraw_approval_requests_leaves_a_pending_elicitation_in_place() {
+        let now = Instant::now();
+        let mut registry = ClaudeSessionRegistry::new();
+        registry
+            .apply(hook("SessionStart", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(
+                hook(
+                    "PermissionRequest",
+                    serde_json::json!({"tool_use_id": "tool-a"}),
+                ),
+                now,
+            )
+            .unwrap();
+        let waiting_input = registry
+            .apply(
+                hook(
+                    "Elicitation",
+                    serde_json::json!({"elicitation_id": "elicit-1"}),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting_input[0].state.activity_state,
+            AiActivityState::WaitingApproval,
+            "approval still outstanding takes priority over the newer elicitation"
+        );
+
+        let changes = registry.withdraw_approval_requests(
+            "launch-1",
+            "session-1",
+            UnansweredReason::DecisionTimeout,
+            now,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].reason,
+            ClaudeStateChangeReason::ApprovalWithdrawn
+        );
+        assert_eq!(
+            changes[0].state.activity_state,
+            AiActivityState::WaitingInput,
+            "the elicitation must still be reported as outstanding"
+        );
+    }
+
+    /// No matching session, a session that never became active, and a
+    /// session with nothing to withdraw must all report zero changes --
+    /// this must never invent a transition where there is nothing to undo.
+    #[test]
+    fn withdraw_approval_requests_is_a_no_op_when_there_is_nothing_to_withdraw() {
+        let now = Instant::now();
+        let mut registry = ClaudeSessionRegistry::new();
+        assert!(registry
+            .withdraw_approval_requests(
+                "no-such-launch",
+                "no-such-session",
+                UnansweredReason::DecisionTimeout,
+                now,
+            )
+            .is_empty());
+
+        registry
+            .apply(hook("SessionStart", serde_json::json!({})), now)
+            .unwrap();
+        registry
+            .apply(hook("UserPromptSubmit", serde_json::json!({})), now)
+            .unwrap();
+        assert!(
+            registry
+                .withdraw_approval_requests(
+                    "launch-1",
+                    "session-1",
+                    UnansweredReason::DecisionTimeout,
+                    now,
+                )
+                .is_empty(),
+            "no approval request is outstanding yet"
+        );
     }
 
     /// The real `PermissionRequest` hook body captured in
