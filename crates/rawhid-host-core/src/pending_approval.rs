@@ -115,6 +115,23 @@ impl ApprovalKey {
     fn codex_target(&self) -> Option<&CodexApprovalTarget> {
         self.codex_target.as_ref()
     }
+
+    /// Internal-only: the exact `(connection_id, thread_id)` this key was
+    /// built for, when it is a Codex key with a known thread id. `None` for
+    /// a Claude Code key, a Codex key built via [`codex_key`] (no thread
+    /// id), or any key whose thread id could not be determined.
+    ///
+    /// This exists purely for Host-side slot/target matching -- comparing a
+    /// ScreenKey slot's assigned session against the HUD's current target
+    /// (`hud_coordinator.rs`'s `target_codex_thread`, `actions.rs`'s
+    /// `codex_target_for_slot` comparison). Like
+    /// `CodexApprovalTarget::thread_id`, the returned thread id must never
+    /// be placed in a HUD payload or a Host Link packet.
+    pub fn codex_thread(&self) -> Option<(&str, &str)> {
+        let target = self.codex_target.as_ref()?;
+        let thread_id = target.thread_id.as_deref()?;
+        Some((target.connection_id.as_str(), thread_id))
+    }
 }
 
 /// Builds the correlation key for a Codex `requestApproval`, from the
@@ -825,6 +842,21 @@ mod tests {
             }
             PendingApprovalContent::Oversized => panic!("unexpected oversized marker"),
         }
+    }
+
+    #[test]
+    fn codex_thread_returns_none_without_a_known_thread_id() {
+        let with_thread = codex_key_for_thread("connection-a", &Value::from(1), Some("thread-a"));
+        assert_eq!(
+            with_thread.codex_thread(),
+            Some(("connection-a", "thread-a"))
+        );
+
+        let without_thread = codex_key("connection-a", &Value::from(2));
+        assert_eq!(without_thread.codex_thread(), None);
+
+        let claude = claude_key("launch-1", "session-1");
+        assert_eq!(claude.codex_thread(), None);
     }
 
     #[test]

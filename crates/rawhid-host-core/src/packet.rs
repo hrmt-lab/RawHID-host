@@ -24,6 +24,10 @@ pub const CAPABILITY_AI_CLIENT_WORK_PHASE: u32 = 1 << 11;
 pub const CAPABILITY_AI_CLIENT_CLAUDE_CODE: u32 = 1 << 12;
 /// Supports the 8-byte AI client state payload with a display slot byte.
 pub const CAPABILITY_AI_CLIENT_DISPLAY_SLOT: u32 = 1 << 13;
+/// Supports the 9-byte AI client state payload with a ScreenKey display
+/// state byte appended after the display slot byte (`docs/ai-approval-hud-design.md`
+/// §8/§11). Only advertised alongside `CAPABILITY_AI_CLIENT_DISPLAY_SLOT`.
+pub const CAPABILITY_AI_CLIENT_SCREENKEY_STATE: u32 = 1 << 14;
 pub const FEATURE_SYSTEM: u8 = 0x00;
 pub const FEATURE_AI_CLIENT: u8 = 0x0A;
 
@@ -241,6 +245,32 @@ pub enum AiWorkPhase {
     Thinking = 0x01,
     Executing = 0x02,
     Searching = 0x03,
+}
+
+/// ScreenKey display state for one AI client slot
+/// (`docs/ai-approval-hud-design.md` §8/§11). This is an enum value only --
+/// no request text, thread id, or session id ever rides in this byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum AiScreenKeyState {
+    /// No pending approval is relevant to this slot.
+    Normal = 0x00,
+    /// This slot is waiting on approval/input and is the current HUD target.
+    WaitingTarget = 0x01,
+    /// This slot is waiting on approval/input but is not the current HUD
+    /// target.
+    WaitingOther = 0x02,
+    /// This slot just dispatched a HUD answer; held for a short window so
+    /// firmware's confirmation animation has time to play out (see
+    /// `commands.rs`'s `HUD_RESPONDED_HOLD` hold logic).
+    Responded = 0x03,
+}
+
+impl Default for AiScreenKeyState {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,6 +1350,10 @@ pub struct AiClientStatePacket {
     pub revision: u16,
     /// Logical ScreenKey destination. Legacy packets always use slot zero.
     pub display_slot: u8,
+    /// ScreenKey display state, appended as a ninth payload byte for devices
+    /// advertising `CAPABILITY_AI_CLIENT_SCREENKEY_STATE`. `new`/`new_for_slot`
+    /// always set this to `Normal`; use `with_screenkey_state` to change it.
+    pub screenkey_state: AiScreenKeyState,
 }
 
 impl AiClientStatePacket {
@@ -1379,7 +1413,16 @@ impl AiClientStatePacket {
             work_phase,
             revision,
             display_slot,
+            screenkey_state: AiScreenKeyState::Normal,
         })
+    }
+
+    /// Sets the ScreenKey display state carried by
+    /// `encode_screenkey_state_payload`/`encode_screenkey_state_report`.
+    /// Has no effect on the legacy/work-phase/display-slot encodings.
+    pub fn with_screenkey_state(mut self, state: AiScreenKeyState) -> Self {
+        self.screenkey_state = state;
+        self
     }
 
     fn encode_payload_with_work_phase(
@@ -1446,6 +1489,23 @@ impl AiClientStatePacket {
     pub fn encode_display_slot_report(self, seq: u8) -> [u8; REPORT_SIZE] {
         let mut report = [0u8; REPORT_SIZE];
         report[1..].copy_from_slice(&self.encode_display_slot_payload(seq));
+        report
+    }
+
+    /// ScreenKey-aware payload, built on top of `encode_display_slot_payload`
+    /// so bytes 0..8 are byte-for-byte identical to that encoding. Byte eight
+    /// (`PAYLOAD_OFFSET + 8`) carries only the `AiScreenKeyState` enum value
+    /// -- never text, a thread id, or a session id.
+    pub fn encode_screenkey_state_payload(self, seq: u8) -> [u8; PACKET_SIZE] {
+        let mut bytes = self.encode_display_slot_payload(seq);
+        bytes[PAYLOAD_OFFSET + 8] = self.screenkey_state as u8;
+        bytes[8] = 9;
+        bytes
+    }
+
+    pub fn encode_screenkey_state_report(self, seq: u8) -> [u8; REPORT_SIZE] {
+        let mut report = [0u8; REPORT_SIZE];
+        report[1..].copy_from_slice(&self.encode_screenkey_state_payload(seq));
         report
     }
 }
@@ -2415,6 +2475,63 @@ mod tests {
             ),
             Err(PacketError::InvalidAiClientDisplaySlot(8))
         ));
+    }
+
+    #[test]
+    fn ai_client_state_screenkey_payload_appends_state_without_changing_slot_layout() {
+        let packet = AiClientStatePacket::new_for_slot(
+            AiClientType::Codex,
+            AiClientVariant::Cli as u8,
+            true,
+            AiActivityState::Working,
+            AiWorkPhase::Executing,
+            0x1234,
+            3,
+        )
+        .unwrap()
+        .with_screenkey_state(AiScreenKeyState::WaitingTarget);
+
+        let slot_aware = packet.encode_display_slot_payload(10);
+        let screenkey_aware = packet.encode_screenkey_state_payload(10);
+
+        assert_eq!(
+            &screenkey_aware[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 8],
+            &slot_aware[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 8]
+        );
+        assert_eq!(screenkey_aware[8], 9);
+        assert_eq!(
+            screenkey_aware[PAYLOAD_OFFSET + 8],
+            AiScreenKeyState::WaitingTarget as u8
+        );
+
+        let report = packet.encode_screenkey_state_report(10);
+        assert_eq!(&report[1..], &screenkey_aware[..]);
+    }
+
+    #[test]
+    fn ai_client_state_defaults_to_normal_screenkey_state() {
+        let packet = AiClientStatePacket::new(
+            AiClientType::Codex,
+            AiClientVariant::Cli as u8,
+            true,
+            AiActivityState::Available,
+            AiWorkPhase::Unspecified,
+            1,
+        )
+        .unwrap();
+        assert_eq!(packet.screenkey_state, AiScreenKeyState::Normal);
+
+        let via_slot = AiClientStatePacket::new_for_slot(
+            AiClientType::Codex,
+            AiClientVariant::Cli as u8,
+            true,
+            AiActivityState::Available,
+            AiWorkPhase::Unspecified,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(via_slot.screenkey_state, AiScreenKeyState::Normal);
     }
 
     #[test]

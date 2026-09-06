@@ -16,8 +16,9 @@ use crate::{
         AiClientStatePacket, AiUsagePacket, ComboInfo, ComboItem, ConfigRequest, ConfigResponse,
         ConfigStatus, DeviceHello, EncoderBinding, EncoderGetBindings, EncoderGetInfo, Packet,
         TimeSyncPacket, UplinkPacket, CAPABILITY_AI_CLIENT_CLAUDE_CODE,
-        CAPABILITY_AI_CLIENT_DISPLAY_SLOT, CAPABILITY_AI_CLIENT_STATE,
-        CAPABILITY_AI_CLIENT_WORK_PHASE, CAPABILITY_CONFIG_RPC, PACKET_SIZE, REPORT_SIZE,
+        CAPABILITY_AI_CLIENT_DISPLAY_SLOT, CAPABILITY_AI_CLIENT_SCREENKEY_STATE,
+        CAPABILITY_AI_CLIENT_STATE, CAPABILITY_AI_CLIENT_WORK_PHASE, CAPABILITY_CONFIG_RPC,
+        PACKET_SIZE, REPORT_SIZE,
     },
 };
 
@@ -512,6 +513,7 @@ impl<T: HidTransport> HidDeviceManager<T> {
         let legacy_report = state.encode_report(seq);
         let work_phase_report = state.encode_work_phase_report(seq);
         let display_slot_report = state.encode_display_slot_report(seq);
+        let screenkey_state_report = state.encode_screenkey_state_report(seq);
         let mut sent = 0usize;
         let previous_len = self.verified.len();
         let mut retained = Vec::with_capacity(self.verified.len());
@@ -520,6 +522,11 @@ impl<T: HidTransport> HidDeviceManager<T> {
             let supports_display_slot = device.capabilities
                 & (CAPABILITY_AI_CLIENT_DISPLAY_SLOT | CAPABILITY_AI_CLIENT_WORK_PHASE)
                 == (CAPABILITY_AI_CLIENT_DISPLAY_SLOT | CAPABILITY_AI_CLIENT_WORK_PHASE);
+            // The 9-byte payload is a strict superset of the 8-byte one, so
+            // it is only sent to a device that advertises all three of bit
+            // 14, bit 13, and bit 11 -- never bit 14 alone.
+            let supports_screenkey_state = supports_display_slot
+                && device.capabilities & CAPABILITY_AI_CLIENT_SCREENKEY_STATE != 0;
             if device.capabilities & CAPABILITY_AI_CLIENT_STATE == 0
                 || (state.display_slot != 0 && !supports_display_slot)
                 || (state.client_type == crate::packet::AiClientType::ClaudeCode
@@ -529,7 +536,9 @@ impl<T: HidTransport> HidDeviceManager<T> {
                 retained.push(device);
                 continue;
             }
-            let report = if supports_display_slot {
+            let report = if supports_screenkey_state {
+                &screenkey_state_report
+            } else if supports_display_slot {
                 &display_slot_report
             } else if device.capabilities & CAPABILITY_AI_CLIENT_WORK_PHASE != 0 {
                 &work_phase_report
@@ -1344,6 +1353,66 @@ mod tests {
         assert_eq!(writes[0].0, "slot");
         assert_eq!(writes[0].1[9], 8);
         assert_eq!(writes[0].1[20], 2);
+    }
+
+    #[test]
+    fn ai_client_state_sends_screenkey_payload_only_to_screenkey_capable_devices() {
+        let slot_caps = CAPABILITY_AI_CLIENT_STATE
+            | CAPABILITY_AI_CLIENT_WORK_PHASE
+            | CAPABILITY_AI_CLIENT_DISPLAY_SLOT;
+        let screenkey_caps = slot_caps | CAPABILITY_AI_CLIENT_SCREENKEY_STATE;
+        // Distinct first bytes: `DeviceInfo::device_uid_hash` in this test
+        // helper derives from the path's first byte, and two devices that
+        // hash the same are treated as one physical keyboard.
+        let slot_only = device_with_capabilities("basic", slot_caps);
+        let screenkey = device_with_capabilities("keyed", screenkey_caps);
+        let transport = MockTransport {
+            candidates: RefCell::new(vec![slot_only, screenkey]),
+            ..MockTransport::default()
+        };
+        transport
+            .hello_paths
+            .borrow_mut()
+            .extend(["basic".to_string(), "keyed".to_string()]);
+        transport.hello_capabilities.borrow_mut().extend([
+            ("basic".to_string(), slot_caps),
+            ("keyed".to_string(), screenkey_caps),
+        ]);
+        let mut manager = HidDeviceManager::new(HidConfig::default(), transport);
+        manager.probe().unwrap();
+        let state = AiClientStatePacket::new_for_slot(
+            crate::packet::AiClientType::Codex,
+            crate::packet::AiClientVariant::Cli as u8,
+            true,
+            crate::packet::AiActivityState::WaitingApproval,
+            crate::packet::AiWorkPhase::Unspecified,
+            21,
+            1,
+        )
+        .unwrap()
+        .with_screenkey_state(crate::packet::AiScreenKeyState::WaitingTarget);
+
+        assert_eq!(manager.send_ai_client_state(state, false).unwrap(), 2);
+        let writes = manager.transport.writes.borrow();
+        let slot_write = writes.iter().find(|write| write.0 == "basic").unwrap();
+        let screenkey_write = writes.iter().find(|write| write.0 == "keyed").unwrap();
+
+        // A device without bit 14 must see byte-for-byte the same 8-byte
+        // payload as before -- not one byte different.
+        assert_eq!(slot_write.1[9], 8);
+        assert_eq!(slot_write.1[20], 1);
+
+        assert_eq!(screenkey_write.1[9], 9);
+        assert_eq!(screenkey_write.1[20], 1);
+        assert_eq!(
+            screenkey_write.1[21],
+            crate::packet::AiScreenKeyState::WaitingTarget as u8
+        );
+        assert_eq!(
+            &screenkey_write.1[13..21],
+            &slot_write.1[13..21],
+            "bytes 0..8 of the screenkey payload must match the display-slot payload exactly"
+        );
     }
 
     #[test]
