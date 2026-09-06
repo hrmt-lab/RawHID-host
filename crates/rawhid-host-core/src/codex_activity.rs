@@ -1685,9 +1685,12 @@ fn ingest_codex_approval(
         kind: body.kind,
         available_decisions: Some(body.available_decisions),
         // Codex's own request id lives in `key`/`approval_turns` above, not
-        // in the body -- these two fields are Claude-only.
+        // in the body -- these three fields are Claude-only. Codex has no
+        // `permission_suggestions` counterpart at all (see that field's own
+        // doc comment on `PendingApprovalBody`).
         tool_use_id: None,
         prompt_id: None,
+        permission_suggestions: None,
     };
     pending_approvals.insert(key, ApprovalClient::Codex, owner, normalized);
 }

@@ -36,12 +36,34 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::claude_decision::{ClaudeDecision, CLAUDE_HUD_DENY_MESSAGE};
+
 /// A single retained body may not exceed this many serialized bytes.
 pub const MAX_PENDING_APPROVAL_BODY_BYTES: usize = 1024 * 1024;
 
 /// The store keeps at most this many unresolved entries at once, across
 /// both clients.
 pub const MAX_ENTRIES: usize = 256;
+
+/// The Host-normalized "allow" element of a Claude Code entry's
+/// `available_decisions` (see that field's doc comment on
+/// [`PendingApprovalBody`] for why Claude Code's array is Host-built rather
+/// than protocol-supplied).
+pub const CLAUDE_DECISION_ALLOW: &str = "allow";
+/// The Host-normalized "deny" element of a Claude Code entry's
+/// `available_decisions`. See [`CLAUDE_DECISION_ALLOW`].
+pub const CLAUDE_DECISION_DENY: &str = "deny";
+/// The Host-normalized "allow, and remember this choice" element of a
+/// Claude Code entry's `available_decisions`. Only present when the real
+/// hook body carried a non-empty `permission_suggestions` array
+/// (`claude_activity.rs`'s `claude_approval_body`) -- unlike
+/// [`CLAUDE_DECISION_ALLOW`]/[`CLAUDE_DECISION_DENY`], which are offered
+/// unconditionally, this element only exists when there is something for it
+/// to apply. Selecting it resolves to `ClaudeDecision::AllowWithPermissions`
+/// (`PendingApprovalStore::claude_response`), carrying the exact
+/// `permission_suggestions` array back out as `updatedPermissions` -- see
+/// that variant's own doc comment for why the array is never reconstructed.
+pub const CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS: &str = "allow_with_permissions";
 
 /// Which AI client an approval request originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,7 +194,22 @@ pub fn codex_key_for_thread(
 /// `PermissionRequest` for the same session overwrites the previous one
 /// (see [`PendingApprovalStore::insert`]).
 pub fn claude_key(launch_id: &str, session_id: &str) -> ApprovalKey {
-    ApprovalKey::new(format!("claude:{launch_id}:{session_id}"))
+    ApprovalKey::new(format!(
+        "{}{session_id}",
+        claude_launch_token_prefix(launch_id)
+    ))
+}
+
+/// The token prefix shared by every [`claude_key`] built for one Claude
+/// Code wrapper launch. This module is the only place that knows a Claude
+/// Code token's format (`"claude:{launch_id}:{session_id}"`); rather than
+/// let another module reconstruct that format to find "every token of this
+/// launch", it calls this function instead. `claude_decision.rs`'s
+/// `ClaudePermissionGate::cancel_launch` is the current caller, for
+/// discarding every hook connection still waiting on a decision when the
+/// launch's wrapper process exits.
+pub fn claude_launch_token_prefix(launch_id: &str) -> String {
+    format!("claude:{launch_id}:")
 }
 
 fn json_rpc_id_token(value: &Value) -> String {
@@ -202,10 +239,33 @@ pub struct PendingApprovalBody {
     pub cwd: Option<String>,
     /// Codex's `kind`, or Claude's `tool_name`.
     pub kind: Option<String>,
-    /// Codex's `availableDecisions`, kept exactly as received. Elements are
-    /// a mix of strings and objects and the set changes per request (see
-    /// `docs/codex-approval-proxy-gate-results.md` §5.1) -- never
-    /// reconstruct or summarize this, just carry it through unchanged.
+    /// The offered decisions, kept exactly as received/normalized -- **but
+    /// the two clients populate this very differently, and only one of them
+    /// may be reconstructed:**
+    ///
+    /// - **Codex**'s `availableDecisions`, carried through *verbatim*.
+    ///   Elements are a mix of strings and objects and the set changes per
+    ///   request (see `docs/codex-approval-proxy-gate-results.md` §5.1).
+    ///   **Never reconstruct or summarize a Codex entry** -- an opaque
+    ///   value must be returned to Codex byte-for-byte, or the App Server
+    ///   may reject it.
+    ///  - **Claude Code**'s hook body has no `availableDecisions` field at
+    ///    all (`docs/claude-permission-hook-gate-results.md` §4) -- the
+    ///    terminal's own allow/deny choice is never sent to Studio. The
+    ///    Host normalizes this itself (`claude_activity.rs`'s
+    ///    `claude_approval_body`), purely so a HUD can offer Claude Code
+    ///    requests through the same index-into-this-array shape as Codex's.
+    ///    The normalized array is `[CLAUDE_DECISION_ALLOW,
+    ///    CLAUDE_DECISION_DENY]`, or, when the hook body also carried a
+    ///    non-empty `permission_suggestions` array, the three-element
+    ///    `[CLAUDE_DECISION_ALLOW, CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS,
+    ///    CLAUDE_DECISION_DENY]` -- always in that order, `allow` first and
+    ///    `deny` last, so a HUD's default selection is never "always allow"
+    ///    and `reject_decision_index_from_body`'s exact-match `"deny"`
+    ///    lookup keeps working regardless of which shape is in play. Unlike
+    ///    Codex's elements, a Claude Code element *is* meant to be
+    ///    interpreted -- `PendingApprovalStore::claude_response` is the one
+    ///    place that does, turning an index back into a `ClaudeDecision`.
     pub available_decisions: Option<Vec<Value>>,
     /// Claude's `tool_use_id`, when the hook body happens to carry one.
     /// Auxiliary only -- the store's correlation key is `(launch_id,
@@ -217,6 +277,28 @@ pub struct PendingApprovalBody {
     /// analogous turn tracking lives outside this body, in
     /// `codex_activity.rs`'s `approval_turns` map.
     pub prompt_id: Option<String>,
+    /// Claude Code's `permission_suggestions` array, verbatim, when the hook
+    /// body carried a non-empty one. Codex has no counterpart at all -- its
+    /// App Server never sends anything like this, so this field is always
+    /// `None` for a Codex entry.
+    ///
+    /// This is a separate field from `available_decisions` on purpose, even
+    /// though both hold opaque arrays the Host must never reinterpret:
+    /// `available_decisions` is the *menu* -- the fixed, Host-built list of
+    /// choices a HUD offers (`[allow, allow_with_permissions, deny]` or
+    /// `[allow, deny]`, per `claude_activity.rs`'s `claude_approval_body`) --
+    /// while this field is the *payload* one specific menu entry
+    /// (`CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS`) applies when chosen. The
+    /// menu is Host-normalized and stable in shape; this field is whatever
+    /// Claude Code happened to send for this one request, cloned exactly as
+    /// received, and handed back out byte-for-byte as `updatedPermissions`
+    /// (`ClaudeDecision::hook_response_body`) if that entry is picked. Never
+    /// interpret, reorder, or rewrite an element of this array -- it was
+    /// captured verbatim from a real Claude Code instance on 2026-09-06 in
+    /// three shapes that shared no common structure beyond being JSON
+    /// objects, so any assumption about its fields beyond "pass it through"
+    /// is unverified.
+    pub permission_suggestions: Option<Vec<Value>>,
 }
 
 impl PendingApprovalBody {
@@ -253,6 +335,18 @@ pub struct CodexPendingResponse {
     pub connection_id: String,
     pub request_id: Value,
     pub decision: Value,
+}
+
+/// Validated routing data for one Claude Code HUD answer. Unlike
+/// [`CodexPendingResponse`], `decision` is not the raw array element --
+/// [`PendingApprovalStore::claude_response`] resolves the Host-normalized
+/// string (`CLAUDE_DECISION_ALLOW`/`CLAUDE_DECISION_DENY`) into an actual
+/// [`ClaudeDecision`], because a Claude Code element (unlike a Codex one) is
+/// meant to be interpreted, not carried through opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudePendingResponse {
+    pub key: ApprovalKey,
+    pub decision: ClaudeDecision,
 }
 
 struct Entry {
@@ -424,6 +518,60 @@ impl PendingApprovalStore {
         })
     }
 
+    /// Looks up a HUD answer for a Claude Code request by its opaque
+    /// request token and decision index, the Claude Code counterpart to
+    /// [`Self::codex_response`]. `None` for a Codex entry -- callers must
+    /// never fall through to treating a Claude Code answer as a Codex one
+    /// or vice versa.
+    ///
+    /// Unlike `codex_response`, the returned decision is not the raw array
+    /// element: only `CLAUDE_DECISION_ALLOW`/
+    /// `CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS`/`CLAUDE_DECISION_DENY` are
+    /// recognized (an unknown value returns `None` rather than inventing a
+    /// decision from it -- see `available_decisions`'s own doc comment on
+    /// why a Claude Code element is interpreted at all).
+    pub fn claude_response(
+        &self,
+        request_token: &str,
+        decision_index: usize,
+    ) -> Option<ClaudePendingResponse> {
+        let inner = self.inner.lock().unwrap();
+        let (key, entry) = inner
+            .entries
+            .iter()
+            .find(|(key, _)| key.token() == request_token)?;
+        if entry.client != ApprovalClient::ClaudeCode {
+            return None;
+        }
+        let PendingApprovalContent::Body(body) = &entry.content else {
+            return None;
+        };
+        let raw = body.available_decisions.as_ref()?.get(decision_index)?;
+        let decision = match raw.as_str()? {
+            CLAUDE_DECISION_ALLOW => ClaudeDecision::Allow,
+            // Defensive, not expected in practice: `available_decisions`
+            // only ever contains this element when `claude_approval_body`
+            // also populated `permission_suggestions` (see that function's
+            // doc comment), so this `?` should never actually fire. But a
+            // future bug that decouples the two must not fall through to
+            // fabricating an `AllowWithPermissions` with an empty/missing
+            // `updates` -- that would apply nothing while looking like it
+            // applied something, which is worse than just failing the
+            // lookup here.
+            CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS => ClaudeDecision::AllowWithPermissions {
+                updates: body.permission_suggestions.clone()?,
+            },
+            CLAUDE_DECISION_DENY => ClaudeDecision::Deny {
+                message: CLAUDE_HUD_DENY_MESSAGE.to_string(),
+            },
+            _ => return None,
+        };
+        Some(ClaudePendingResponse {
+            key: key.clone(),
+            decision,
+        })
+    }
+
     /// Returns the key and snapshot of the most recently *inserted* entry
     /// (the LRU's back), for a HUD showing "the newest unresolved request"
     /// per `docs/ai-approval-hud-design.md` §10: "複数セッションが同時に承認
@@ -524,6 +672,7 @@ mod tests {
             available_decisions: None,
             tool_use_id: None,
             prompt_id: None,
+            permission_suggestions: None,
         }
     }
 
@@ -890,5 +1039,188 @@ mod tests {
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.decision, decisions[1]);
         assert!(store.codex_response(response.key.token(), 3).is_none());
+    }
+
+    fn insert_claude(
+        store: &PendingApprovalStore,
+        launch_id: &str,
+        session_id: &str,
+    ) -> ApprovalKey {
+        let key = claude_key(launch_id, session_id);
+        let mut approval = body("mkdir foo");
+        approval.available_decisions = Some(vec![
+            Value::from(CLAUDE_DECISION_ALLOW),
+            Value::from(CLAUDE_DECISION_DENY),
+        ]);
+        store.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: launch_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+            approval,
+        );
+        key
+    }
+
+    #[test]
+    fn claude_response_resolves_index_zero_and_one_to_allow_and_deny() {
+        let store = PendingApprovalStore::new();
+        let key = insert_claude(&store, "launch-1", "session-1");
+
+        let allow = store
+            .claude_response(key.token(), 0)
+            .expect("index 0 is CLAUDE_DECISION_ALLOW");
+        assert_eq!(allow.key, key);
+        assert_eq!(allow.decision, ClaudeDecision::Allow);
+
+        let deny = store
+            .claude_response(key.token(), 1)
+            .expect("index 1 is CLAUDE_DECISION_DENY");
+        assert_eq!(
+            deny.decision,
+            ClaudeDecision::Deny {
+                message: CLAUDE_HUD_DENY_MESSAGE.to_string()
+            }
+        );
+
+        // An out-of-range index has no interpretation.
+        assert!(store.claude_response(key.token(), 2).is_none());
+    }
+
+    #[test]
+    fn claude_response_returns_none_for_a_codex_entry() {
+        let store = PendingApprovalStore::new();
+        let key = codex_key("connection-a", &Value::from(1));
+        let mut approval = body("mkdir foo");
+        approval.available_decisions = Some(vec![Value::from("accept")]);
+        store.insert(
+            key.clone(),
+            ApprovalClient::Codex,
+            codex_owner("connection-a"),
+            approval,
+        );
+
+        assert!(store.claude_response(key.token(), 0).is_none());
+    }
+
+    /// Regression for the boundary the design calls out explicitly: a
+    /// Claude Code entry's opaque-looking `available_decisions` must never
+    /// be handed to Codex's response path, even though both entries share
+    /// the same store and lookup-by-token mechanism.
+    #[test]
+    fn codex_response_returns_none_for_a_claude_entry() {
+        let store = PendingApprovalStore::new();
+        let key = insert_claude(&store, "launch-1", "session-1");
+
+        assert!(store.codex_response(key.token(), 0).is_none());
+    }
+
+    /// Builds a Claude Code entry with the three-element
+    /// `[allow, allow_with_permissions, deny]` array, the shape
+    /// `claude_approval_body` only produces when the real hook body also
+    /// carried a non-empty `permission_suggestions` array.
+    fn insert_claude_with_permission_suggestions(
+        store: &PendingApprovalStore,
+        launch_id: &str,
+        session_id: &str,
+        suggestions: Vec<Value>,
+    ) -> ApprovalKey {
+        let key = claude_key(launch_id, session_id);
+        let mut approval = body("mkdir foo");
+        approval.available_decisions = Some(vec![
+            Value::from(CLAUDE_DECISION_ALLOW),
+            Value::from(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS),
+            Value::from(CLAUDE_DECISION_DENY),
+        ]);
+        approval.permission_suggestions = Some(suggestions);
+        store.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: launch_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+            approval,
+        );
+        key
+    }
+
+    /// Pins the exact contract `commands.rs`'s `respond_to_claude_approval`
+    /// depends on: picking the middle index of a three-element array must
+    /// resolve to `AllowWithPermissions`, and the `updates` it carries must
+    /// be identical -- same elements, same order -- to whatever
+    /// `permission_suggestions` the hook body actually sent. Nothing here is
+    /// reconstructed; `claude_response` only ever clones what was stored.
+    #[test]
+    fn claude_response_resolves_the_middle_index_to_allow_with_permissions_with_untouched_updates()
+    {
+        let store = PendingApprovalStore::new();
+        let suggestions = vec![serde_json::json!({
+            "type": "addRules",
+            "behavior": "allow",
+            "destination": "localSettings",
+            "rules": [{"toolName": "PowerShell", "ruleContent": "New-Item -ItemType Directory ko3-test8"}]
+        })];
+        let key = insert_claude_with_permission_suggestions(
+            &store,
+            "launch-1",
+            "session-1",
+            suggestions.clone(),
+        );
+
+        let response = store
+            .claude_response(key.token(), 1)
+            .expect("index 1 is CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS");
+        assert_eq!(response.key, key);
+        assert_eq!(
+            response.decision,
+            ClaudeDecision::AllowWithPermissions {
+                updates: suggestions
+            }
+        );
+
+        // index 0 and 2 still resolve to plain allow/deny in this shape.
+        assert_eq!(
+            store.claude_response(key.token(), 0).unwrap().decision,
+            ClaudeDecision::Allow
+        );
+        assert_eq!(
+            store.claude_response(key.token(), 2).unwrap().decision,
+            ClaudeDecision::Deny {
+                message: CLAUDE_HUD_DENY_MESSAGE.to_string()
+            }
+        );
+    }
+
+    /// Defensive regression for the fallback documented on
+    /// `claude_response`'s `CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS` arm: if
+    /// an entry's `available_decisions` somehow offers this element without
+    /// a matching `permission_suggestions` body (should not happen in
+    /// practice -- see `claude_approval_body`), the lookup must fail closed
+    /// rather than fabricate a decision with empty `updates`.
+    #[test]
+    fn claude_response_returns_none_for_allow_with_permissions_without_a_suggestions_body() {
+        let store = PendingApprovalStore::new();
+        let key = claude_key("launch-1", "session-1");
+        let mut approval = body("mkdir foo");
+        approval.available_decisions = Some(vec![
+            Value::from(CLAUDE_DECISION_ALLOW),
+            Value::from(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS),
+            Value::from(CLAUDE_DECISION_DENY),
+        ]);
+        // permission_suggestions deliberately left `None`.
+        store.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            approval,
+        );
+
+        assert!(store.claude_response(key.token(), 1).is_none());
     }
 }

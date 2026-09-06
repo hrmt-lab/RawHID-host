@@ -10,6 +10,7 @@ pub mod active_app;
 pub mod ai_usage;
 pub mod app_match;
 pub mod claude_activity;
+pub mod claude_decision;
 pub mod claude_hook_event;
 pub mod claude_hook_helper;
 pub mod claude_hooks;
@@ -35,12 +36,16 @@ pub use claude_activity::{
     ClaudeSessionRegistry, ClaudeSessionSnapshot, ClaudeStateChange, ClaudeStateChangeReason,
     CLAUDE_DETAIL_STALE_TIMEOUT,
 };
+pub use claude_decision::{
+    ClaudeDecision, ClaudePermissionGate, CLAUDE_PERMISSION_DECISION_TIMEOUT,
+};
 pub use claude_hook_event::{ClaudeHookEvent, ClaudeObserverEvent, ClaudeWrapperExited};
 pub use claude_hook_helper::run_claude_hook_helper;
 pub use claude_hooks::{
     write_claude_observer_plugin, ClaudePluginArtifacts, ClaudePluginError, ClaudePluginOptions,
-    CLAUDE_PROMPT_HOOK_TIMEOUT_SECONDS, CLAUDE_SESSION_START_TIMEOUT_SECONDS,
-    CLAUDE_STOP_HOOK_TIMEOUT_SECONDS, CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS,
+    CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS, CLAUDE_PROMPT_HOOK_TIMEOUT_SECONDS,
+    CLAUDE_SESSION_START_TIMEOUT_SECONDS, CLAUDE_STOP_HOOK_TIMEOUT_SECONDS,
+    CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS,
 };
 pub use claude_observer::{
     ClaudeObserverConfig, ClaudeObserverCounters, ClaudeObserverError, ClaudeObserverEvents,
@@ -80,8 +85,9 @@ pub use packet::{
     FEATURE_AI_CLIENT, FEATURE_SYSTEM, PACKET_SIZE, REPORT_SIZE,
 };
 pub use pending_approval::{
-    claude_key, codex_key, ApprovalClient, ApprovalKey, ApprovalOwner, CodexPendingResponse,
-    PendingApprovalBody, PendingApprovalContent, PendingApprovalSnapshot, PendingApprovalStore,
+    claude_key, claude_launch_token_prefix, codex_key, ApprovalClient, ApprovalKey, ApprovalOwner,
+    ClaudePendingResponse, CodexPendingResponse, PendingApprovalBody, PendingApprovalContent,
+    PendingApprovalSnapshot, PendingApprovalStore, CLAUDE_DECISION_ALLOW, CLAUDE_DECISION_DENY,
     MAX_ENTRIES, MAX_PENDING_APPROVAL_BODY_BYTES,
 };
 pub use runner::{

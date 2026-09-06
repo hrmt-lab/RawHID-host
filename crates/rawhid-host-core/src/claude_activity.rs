@@ -4,15 +4,17 @@ use std::{
 };
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
+    claude_decision::ClaudePermissionGate,
     claude_hook_event::{ClaudeHookEvent, ClaudeObserverEvent},
     next_ai_session_registration_order,
     packet::{AiActivityState, AiWorkPhase},
     pending_approval::{
         claude_key, ApprovalClient, ApprovalOwner, PendingApprovalBody, PendingApprovalContent,
-        PendingApprovalStore,
+        PendingApprovalStore, CLAUDE_DECISION_ALLOW, CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS,
+        CLAUDE_DECISION_DENY,
     },
 };
 
@@ -180,20 +182,51 @@ impl ClaudeEventAdapter {
 /// Call `ingest` alongside (not instead of) `ClaudeSessionRegistry::apply`
 /// for the same event; the two are independent observers of the same
 /// stream.
+///
+/// `ingest` also takes a `&ClaudePermissionGate`, which was not true before
+/// stage 3 of `docs/ai-approval-hud-design.md`. The reason is first-wins
+/// arbitration (§9.4): a `PermissionRequest` hook connection is held open
+/// by `claude_observer.rs` waiting on the gate for a decision, in parallel
+/// with Claude Code's own terminal prompt. When the *terminal* answers
+/// first, the tool actually runs (or the request is explicitly denied),
+/// which arrives here as `PostToolUse` / `PermissionDenied` / `Stop` /
+/// `SessionEnd` / `WrapperExited` -- exactly the events that already
+/// resolved `store` before this stage existed. Each of those must now also
+/// cancel the matching gate waiter, or the still-open hook connection would
+/// eventually time out and fall back to 204 correctly, but only after
+/// needlessly holding the connection (and the user's mental model of "did
+/// my keyboard press do anything") for the rest of the hook's timeout.
+/// Canceling immediately here is what makes the terminal's first answer
+/// visibly final.
 #[derive(Debug, Default)]
 pub struct ClaudeApprovalBodyConsumer;
 
 impl ClaudeApprovalBodyConsumer {
-    pub fn ingest(&self, store: &PendingApprovalStore, event: &ClaudeObserverEvent) {
+    pub fn ingest(
+        &self,
+        store: &PendingApprovalStore,
+        gate: &ClaudePermissionGate,
+        event: &ClaudeObserverEvent,
+    ) {
         match event {
-            ClaudeObserverEvent::Hook(hook) => self.ingest_hook(store, hook),
+            ClaudeObserverEvent::Hook(hook) => self.ingest_hook(store, gate, hook),
             // A wrapper ending takes every session of that launch down with
-            // it, even ones this consumer never saw a SessionStart for.
-            ClaudeObserverEvent::WrapperExited(exit) => store.clear_claude_launch(&exit.launch_id),
+            // it, even ones this consumer never saw a SessionStart for. Any
+            // hook connection still waiting on a decision for one of that
+            // launch's sessions is released the same way.
+            ClaudeObserverEvent::WrapperExited(exit) => {
+                store.clear_claude_launch(&exit.launch_id);
+                gate.cancel_launch(&exit.launch_id);
+            }
         }
     }
 
-    fn ingest_hook(&self, store: &PendingApprovalStore, hook: &ClaudeHookEvent) {
+    fn ingest_hook(
+        &self,
+        store: &PendingApprovalStore,
+        gate: &ClaudePermissionGate,
+        hook: &ClaudeHookEvent,
+    ) {
         let Some(session_id) = hook.session_id.as_deref() else {
             return;
         };
@@ -248,6 +281,12 @@ impl ClaudeApprovalBodyConsumer {
                 };
                 if should_resolve {
                     store.resolve(&key);
+                    // The terminal (or an already-run tool) resolved this
+                    // request first; a hook connection still waiting on the
+                    // gate for the same token must not also receive a
+                    // decision -- see this consumer's own doc comment on
+                    // why `ingest` touches the gate at all.
+                    gate.cancel(key.token());
                 }
             }
             // The turn (or session) ending leaves nothing left to answer,
@@ -257,6 +296,7 @@ impl ClaudeApprovalBodyConsumer {
                     launch_id: hook.launch_id.clone(),
                     session_id: session_id.to_string(),
                 });
+                gate.cancel(claude_key(&hook.launch_id, session_id).token());
             }
             _ => {}
         }
@@ -266,9 +306,31 @@ impl ClaudeApprovalBodyConsumer {
 /// Builds the normalized body for one Claude Code `PermissionRequest`. See
 /// the comparison table in `docs/ai-approval-hud-design.md` §7.2: Claude
 /// Code has no `reason` and no `availableDecisions` in the hook body --
-/// options are just allow/deny, which a HUD normalizes on the Host side in
-/// a later phase (`docs/claude-permission-hook-gate-results.md` §4 notes
-/// the choices shown in the terminal aren't even present in this body).
+/// the terminal's own choices aren't even present in it
+/// (`docs/claude-permission-hook-gate-results.md` §4). Stage 3 normalizes
+/// this on the Host side instead, into `[CLAUDE_DECISION_ALLOW,
+/// CLAUDE_DECISION_DENY]` a HUD can offer exactly like Codex's own
+/// `availableDecisions` array (`pending_approval.rs`'s
+/// `PendingApprovalStore::claude_response` is what turns an index into it
+/// back into a `ClaudeDecision`).
+///
+/// A real hook body can also carry a `permission_suggestions` array -- the
+/// terminal's own "always allow" candidates, captured and verified against a
+/// real Claude Code instance on 2026-09-06 (see `permission_suggestions`'s
+/// own doc comment on `PendingApprovalBody` for the three shapes observed
+/// and why this array is retained verbatim rather than interpreted here).
+/// When that array is present and non-empty, the normalized
+/// `available_decisions` grows a third, middle element,
+/// `CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS`, so a HUD can offer "allow, and
+/// remember this choice" as a single combined option (per the design's
+/// instruction to apply the whole suggestion set at once, never one rule at
+/// a time). `allow` stays first and `deny` stays last in both shapes --
+/// first so a HUD's default selection is never "always allow" by accident,
+/// last because `hud_coordinator.rs`'s `reject_decision_index_from_body`
+/// finds Claude Code's reject side via an exact `"deny"` match and must keep
+/// finding it regardless of which shape is in play. An absent field, an
+/// empty array, or a non-array value all fall back to the plain two-element
+/// shape -- none of those are "there is a suggestion to offer."
 fn claude_approval_body(body: &Value) -> PendingApprovalBody {
     let tool_input = body.get("tool_input");
     let command = tool_input
@@ -280,18 +342,37 @@ fn claude_approval_body(body: &Value) -> PendingApprovalBody {
             serde_json::to_string(input).unwrap_or_else(|_| "<tool_input>".to_string())
         })
     });
+    // Only a non-empty JSON array counts as "there is a suggestion to
+    // offer" -- see this function's own doc comment on why an absent field,
+    // an empty array, and a non-array value are all treated identically
+    // (plain allow/deny, no `permission_suggestions` retained).
+    let permission_suggestions = body
+        .get("permission_suggestions")
+        .and_then(Value::as_array)
+        .filter(|suggestions| !suggestions.is_empty())
+        .cloned();
+    let available_decisions = if permission_suggestions.is_some() {
+        vec![
+            json!(CLAUDE_DECISION_ALLOW),
+            json!(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS),
+            json!(CLAUDE_DECISION_DENY),
+        ]
+    } else {
+        vec![json!(CLAUDE_DECISION_ALLOW), json!(CLAUDE_DECISION_DENY)]
+    };
     PendingApprovalBody {
         primary_text,
         full_command: command,
         reason: None,
         cwd: required_string(body, "cwd"),
         kind: required_string(body, "tool_name"),
-        available_decisions: None,
+        available_decisions: Some(available_decisions),
         // Auxiliary only -- see the doc comments on these fields in
         // `pending_approval.rs`. Absent in the real capture (§4), present
         // when Claude Code happens to include it.
         tool_use_id: required_string(body, "tool_use_id"),
         prompt_id: required_string(body, "prompt_id"),
+        permission_suggestions,
     }
 }
 
@@ -1495,15 +1576,98 @@ mod tests {
             Some("C:\\Users\\example\\keylink-claude-permission-probe-8")
         );
         assert_eq!(extracted.kind.as_deref(), Some("PowerShell"));
-        // Claude Code has no `reason` and no `availableDecisions` field.
+        // Claude Code's hook body itself has no `reason` field.
         assert_eq!(extracted.reason, None);
-        assert_eq!(extracted.available_decisions, None);
+        // The hook body has no `availableDecisions` field at all, but the
+        // Host normalizes one anyway (see `claude_approval_body`'s doc
+        // comment) -- and the real KO3 capture's `permission_suggestions` is
+        // non-empty, so the normalized array grows the middle
+        // `allow_with_permissions` element rather than staying two-element.
+        assert_eq!(
+            extracted.available_decisions,
+            Some(vec![
+                json!(CLAUDE_DECISION_ALLOW),
+                json!(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS),
+                json!(CLAUDE_DECISION_DENY)
+            ])
+        );
+        // permission_suggestions itself is retained verbatim, not just
+        // reflected in available_decisions's shape.
+        assert_eq!(
+            extracted.permission_suggestions,
+            ko3_hook_body()
+                .get("permission_suggestions")
+                .and_then(Value::as_array)
+                .cloned()
+        );
         // The real capture has no `tool_use_id`, but does carry `prompt_id`.
         assert_eq!(extracted.tool_use_id, None);
         assert_eq!(
             extracted.prompt_id.as_deref(),
             Some("ad630989-0000-0000-0000-000000000000")
         );
+    }
+
+    /// Pins the three "no suggestion to offer" cases together: a missing
+    /// `permission_suggestions` field, an explicit empty array, and a
+    /// present-but-not-an-array value all normalize identically to the
+    /// plain two-element `[allow, deny]` -- none of them retain anything in
+    /// `permission_suggestions` either. This is test #1 from the design's
+    /// required-test list, covering every input the design calls "not a
+    /// suggestion to offer" in one place so a future change to one branch
+    /// cannot silently diverge from the other two.
+    #[test]
+    fn claude_approval_body_offers_only_allow_and_deny_when_there_is_no_real_suggestion() {
+        let missing = serde_json::json!({"tool_name": "Bash"});
+        let empty = serde_json::json!({"tool_name": "Bash", "permission_suggestions": []});
+        let not_an_array =
+            serde_json::json!({"tool_name": "Bash", "permission_suggestions": "not-an-array"});
+
+        for body in [missing, empty, not_an_array] {
+            let extracted = claude_approval_body(&body);
+            assert_eq!(
+                extracted.available_decisions,
+                Some(vec![
+                    json!(CLAUDE_DECISION_ALLOW),
+                    json!(CLAUDE_DECISION_DENY)
+                ]),
+                "unexpected available_decisions for input: {body:?}"
+            );
+            assert_eq!(
+                extracted.permission_suggestions, None,
+                "unexpected permission_suggestions for input: {body:?}"
+            );
+        }
+    }
+
+    /// The positive counterpart to the test above: test #1's third
+    /// requirement, that a non-empty `permission_suggestions` array
+    /// produces the three-element `[allow, allow_with_permissions, deny]`
+    /// array in exactly that order, with the input array retained
+    /// unmodified.
+    #[test]
+    fn claude_approval_body_offers_allow_with_permissions_when_suggestions_are_present() {
+        let suggestions = vec![serde_json::json!({
+            "type": "addRules",
+            "behavior": "allow",
+            "destination": "session",
+            "rules": [{"toolName": "Read", "ruleContent": "//c/temp/**"}]
+        })];
+        let body = serde_json::json!({
+            "tool_name": "Read",
+            "permission_suggestions": suggestions
+        });
+
+        let extracted = claude_approval_body(&body);
+        assert_eq!(
+            extracted.available_decisions,
+            Some(vec![
+                json!(CLAUDE_DECISION_ALLOW),
+                json!(CLAUDE_DECISION_ALLOW_WITH_PERMISSIONS),
+                json!(CLAUDE_DECISION_DENY)
+            ])
+        );
+        assert_eq!(extracted.permission_suggestions, Some(suggestions));
     }
 
     #[test]
@@ -1521,44 +1685,61 @@ mod tests {
     fn consumer_inserts_on_permission_request_and_resolves_on_permission_denied() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
 
-        consumer.ingest(
-            &store,
+        consumer.ingest(&store, &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-a", "cwd": "C:\\work", "tool_name": "Bash"}),
             ),
         );
         assert!(store.get(&key).is_some());
+        // A hook connection is registered on the gate the moment
+        // `claude_observer.rs` sees the `PermissionRequest` -- simulate
+        // that here so this test can observe the consumer canceling it.
+        let waiter = gate.register(key.token().to_string());
 
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionDenied",
                 serde_json::json!({"tool_use_id": "tool-a"}),
             ),
         );
         assert!(store.get(&key).is_none());
+        assert!(
+            waiter.blocking_recv().is_err(),
+            "PermissionDenied must cancel the gate waiter, not leave it open"
+        );
     }
 
     #[test]
     fn consumer_resolves_on_post_tool_use() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-a"}),
             ),
         );
+        let waiter = gate.register(key.token().to_string());
         consumer.ingest(
             &store,
+            &gate,
             &hook("PostToolUse", serde_json::json!({"tool_use_id": "tool-a"})),
         );
         assert!(store.get(&key).is_none());
+        assert!(
+            waiter.blocking_recv().is_err(),
+            "PostToolUse must cancel the gate waiter, not leave it open"
+        );
     }
 
     /// The correlation key is `(launch_id, session_id)`, not `tool_use_id`
@@ -1572,9 +1753,11 @@ mod tests {
     fn consumer_does_not_resolve_when_a_different_tools_post_tool_use_arrives() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "approval-tool"}),
@@ -1583,6 +1766,7 @@ mod tests {
         // An unrelated, concurrently running tool completes.
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PostToolUse",
                 serde_json::json!({"tool_use_id": "search-tool"}),
@@ -1596,6 +1780,7 @@ mod tests {
         // The approval's own tool finishing does resolve it.
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PostToolUse",
                 serde_json::json!({"tool_use_id": "approval-tool"}),
@@ -1608,35 +1793,50 @@ mod tests {
     fn consumer_clears_the_session_on_stop_and_session_end() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-a"}),
             ),
         );
-        consumer.ingest(&store, &hook("Stop", serde_json::json!({})));
+        let stop_waiter = gate.register(key.token().to_string());
+        consumer.ingest(&store, &gate, &hook("Stop", serde_json::json!({})));
         assert!(store.get(&key).is_none());
+        assert!(
+            stop_waiter.blocking_recv().is_err(),
+            "Stop must cancel the gate waiter, not leave it open"
+        );
 
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-b"}),
             ),
         );
-        consumer.ingest(&store, &hook("SessionEnd", serde_json::json!({})));
+        let session_end_waiter = gate.register(key.token().to_string());
+        consumer.ingest(&store, &gate, &hook("SessionEnd", serde_json::json!({})));
         assert!(store.get(&key).is_none());
+        assert!(
+            session_end_waiter.blocking_recv().is_err(),
+            "SessionEnd must cancel the gate waiter, not leave it open"
+        );
     }
 
     #[test]
     fn a_new_permission_request_overwrites_the_sessions_previous_pending_request() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-a", "tool_name": "Bash"}),
@@ -1644,6 +1844,7 @@ mod tests {
         );
         consumer.ingest(
             &store,
+            &gate,
             &hook(
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-b", "tool_name": "Write"}),
@@ -1663,10 +1864,12 @@ mod tests {
     fn consumer_clears_every_session_of_a_launch_on_wrapper_exit() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key_a = claude_key("launch-1", "session-1");
         let key_b = claude_key("launch-1", "session-2");
         consumer.ingest(
             &store,
+            &gate,
             &hook_for_session(
                 "session-1",
                 "PermissionRequest",
@@ -1675,15 +1878,19 @@ mod tests {
         );
         consumer.ingest(
             &store,
+            &gate,
             &hook_for_session(
                 "session-2",
                 "PermissionRequest",
                 serde_json::json!({"tool_use_id": "tool-b"}),
             ),
         );
+        let waiter_a = gate.register(key_a.token().to_string());
+        let waiter_b = gate.register(key_b.token().to_string());
 
         consumer.ingest(
             &store,
+            &gate,
             &ClaudeObserverEvent::WrapperExited(ClaudeWrapperExited {
                 launch_id: "launch-1".to_string(),
                 exit_code: 0,
@@ -1692,15 +1899,25 @@ mod tests {
 
         assert!(store.get(&key_a).is_none());
         assert!(store.get(&key_b).is_none());
+        assert!(
+            waiter_a.blocking_recv().is_err(),
+            "WrapperExited must cancel every waiter of that launch"
+        );
+        assert!(
+            waiter_b.blocking_recv().is_err(),
+            "WrapperExited must cancel every waiter of that launch"
+        );
     }
 
     #[test]
     fn wrapper_exit_only_clears_its_own_launch() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key_other_launch = claude_key("launch-2", "session-2");
         consumer.ingest(
             &store,
+            &gate,
             &hook_for_launch_session(
                 "launch-2",
                 "session-2",
@@ -1710,6 +1927,7 @@ mod tests {
         );
         consumer.ingest(
             &store,
+            &gate,
             &ClaudeObserverEvent::WrapperExited(ClaudeWrapperExited {
                 launch_id: "launch-1".to_string(),
                 exit_code: 0,
@@ -1729,8 +1947,9 @@ mod tests {
     fn permission_request_without_tool_use_id_is_still_stored_and_keyed_by_session() {
         let store = PendingApprovalStore::new();
         let consumer = ClaudeApprovalBodyConsumer;
+        let gate = ClaudePermissionGate::default();
         let key = claude_key("launch-1", "session-1");
-        consumer.ingest(&store, &hook("PermissionRequest", ko3_hook_body()));
+        consumer.ingest(&store, &gate, &hook("PermissionRequest", ko3_hook_body()));
         let snapshot = store.get(&key).expect("stored despite missing tool_use_id");
         match snapshot.content {
             PendingApprovalContent::Body(body) => {

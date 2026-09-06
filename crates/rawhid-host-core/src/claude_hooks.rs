@@ -12,6 +12,17 @@ pub const CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS: u64 = 1;
 pub const CLAUDE_PROMPT_HOOK_TIMEOUT_SECONDS: u64 = 2;
 pub const CLAUDE_STOP_HOOK_TIMEOUT_SECONDS: u64 = 3;
 pub const CLAUDE_SESSION_START_TIMEOUT_SECONDS: u64 = 2;
+/// `PermissionRequest` alone gets a much longer hook timeout than every
+/// other hook: this is the one hook Studio holds open waiting for a HUD
+/// decision (`docs/ai-approval-hud-design.md` §9.2), long enough for a
+/// person to actually read the HUD and press a key.
+/// `docs/claude-permission-hook-gate-results.md` §Q6 confirmed this is safe
+/// to extend -- Claude Code never waits for the hook itself (it shows its
+/// own terminal prompt after ~3s regardless), so a longer `timeout` here
+/// only extends how long the *keyboard* answer path stays available, never
+/// how long the user is blocked. `claude_decision::CLAUDE_PERMISSION_DECISION_TIMEOUT`
+/// is intentionally shorter than this value -- see its own doc comment.
+pub const CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct ClaudePluginOptions {
@@ -144,7 +155,7 @@ fn hooks_json(
             "SessionStart": [session_start],
             "UserPromptSubmit": [http_hook(CLAUDE_PROMPT_HOOK_TIMEOUT_SECONDS)],
             "PreToolUse": [matched_http_hook("*", CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS)],
-            "PermissionRequest": [matched_http_hook("*", CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS)],
+            "PermissionRequest": [matched_http_hook("*", CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS)],
             "PermissionDenied": [matched_http_hook("*", CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS)],
             "PostToolUse": [matched_http_hook("*", CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS)],
             "PostToolUseFailure": [matched_http_hook("*", CLAUDE_TOOL_HOOK_TIMEOUT_SECONDS)],
@@ -246,6 +257,18 @@ mod tests {
         assert!(!hooks_bytes.starts_with(&[0xef, 0xbb, 0xbf]));
         let hooks: serde_json::Value = serde_json::from_slice(&hooks_bytes).unwrap();
         assert_eq!(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 1);
+        // `PermissionRequest` alone is extended to 60s so a HUD decision has
+        // time to arrive; every other hook keeps its short, observation-only
+        // timeout (see `CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS`'s doc
+        // comment).
+        assert_eq!(
+            hooks["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            60
+        );
+        assert_eq!(
+            hooks["hooks"]["PermissionDenied"][0]["hooks"][0]["timeout"],
+            1
+        );
         assert_eq!(
             hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
             2
