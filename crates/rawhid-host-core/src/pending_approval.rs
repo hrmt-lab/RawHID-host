@@ -95,6 +95,7 @@ pub enum ApprovalOwner {
 pub struct ApprovalKey {
     token: String,
     codex_target: Option<CodexApprovalTarget>,
+    claude_target: Option<ClaudeApprovalTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,16 @@ struct CodexApprovalTarget {
     /// Internal only: binds this request to the exact Codex display thread.
     /// It is never included in a HUD payload or Host Link packet.
     thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeApprovalTarget {
+    /// Internal only, like `CodexApprovalTarget`'s fields: binds this request
+    /// to the exact Claude Code launch and session so Host-side slot/target
+    /// matching can find it. Never included in a HUD payload or Host Link
+    /// packet.
+    launch_id: String,
+    session_id: String,
 }
 
 impl PartialEq for ApprovalKey {
@@ -121,10 +132,26 @@ impl std::hash::Hash for ApprovalKey {
 }
 
 impl ApprovalKey {
+    /// Builds a bare key carrying only an opaque token, with no client-
+    /// specific target of either kind: `codex_thread()`/`claude_session()`
+    /// both return `None` on a key built this way. A routable key -- one
+    /// that can name a Codex thread or a Claude Code session -- comes from
+    /// `codex_key`/`codex_key_for_thread`/`claude_key` instead.
+    ///
+    /// This constructor is for callers that hold nothing but the opaque
+    /// token and only need to *address* an entry that is already in the
+    /// store: `PartialEq`/`Hash` above compare tokens alone, so a bare key
+    /// matches the routable key an entry was inserted under.
+    /// `rawhid-host-tauri`'s `drain_claude_state_changes` does exactly this
+    /// when it withdraws an approval the gate reported as no longer
+    /// answerable (`ClaudePermissionGate::drain_unanswerable` hands back
+    /// tokens, not keys). Tests that just need something to compare or hash
+    /// use it the same way.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             token: value.into(),
             codex_target: None,
+            claude_target: None,
         }
     }
 
@@ -145,14 +172,30 @@ impl ApprovalKey {
     ///
     /// This exists purely for Host-side slot/target matching -- comparing a
     /// ScreenKey slot's assigned session against the HUD's current target
-    /// (`hud_coordinator.rs`'s `target_codex_thread`, `actions.rs`'s
-    /// `codex_target_for_slot` comparison). Like
+    /// (`hud_coordinator.rs`'s `target_session`, `actions.rs`'s
+    /// `hud_target_for_slot`/`codex_target_for_slot` comparison). Like
     /// `CodexApprovalTarget::thread_id`, the returned thread id must never
     /// be placed in a HUD payload or a Host Link packet.
     pub fn codex_thread(&self) -> Option<(&str, &str)> {
         let target = self.codex_target.as_ref()?;
         let thread_id = target.thread_id.as_deref()?;
         Some((target.connection_id.as_str(), thread_id))
+    }
+
+    /// Internal-only: the exact `(launch_id, session_id)` this key was built
+    /// for, when it is a Claude Code key built via [`claude_key`]. `None` for
+    /// a Codex key or a Claude Code key built via [`ApprovalKey::new`]
+    /// (should not happen in production; see that constructor's doc note).
+    ///
+    /// This is the Claude Code counterpart to [`Self::codex_thread`] and
+    /// exists for the same purpose -- Host-side slot/target matching
+    /// (`hud_coordinator.rs`'s `target_session`, `actions.rs`'s
+    /// `hud_target_for_slot`/`claude_target_for_slot` comparison). Like
+    /// `codex_thread`, the returned pair must never be placed in a HUD
+    /// payload or a Host Link packet.
+    pub fn claude_session(&self) -> Option<(&str, &str)> {
+        let target = self.claude_target.as_ref()?;
+        Some((target.launch_id.as_str(), target.session_id.as_str()))
     }
 }
 
@@ -178,6 +221,7 @@ pub fn codex_key_for_thread(
             request_id: request_id.clone(),
             thread_id: thread_id.map(str::to_string),
         }),
+        claude_target: None,
     }
 }
 
@@ -194,10 +238,14 @@ pub fn codex_key_for_thread(
 /// `PermissionRequest` for the same session overwrites the previous one
 /// (see [`PendingApprovalStore::insert`]).
 pub fn claude_key(launch_id: &str, session_id: &str) -> ApprovalKey {
-    ApprovalKey::new(format!(
-        "{}{session_id}",
-        claude_launch_token_prefix(launch_id)
-    ))
+    ApprovalKey {
+        token: format!("{}{session_id}", claude_launch_token_prefix(launch_id)),
+        codex_target: None,
+        claude_target: Some(ClaudeApprovalTarget {
+            launch_id: launch_id.to_string(),
+            session_id: session_id.to_string(),
+        }),
+    }
 }
 
 /// The token prefix shared by every [`claude_key`] built for one Claude
@@ -1006,6 +1054,20 @@ mod tests {
 
         let claude = claude_key("launch-1", "session-1");
         assert_eq!(claude.codex_thread(), None);
+    }
+
+    /// Mirrors `codex_thread_returns_none_without_a_known_thread_id`: a
+    /// `claude_key` exposes its `(launch_id, session_id)` via
+    /// `claude_session`, but never through `codex_thread`, and a Codex key
+    /// never exposes anything through `claude_session`.
+    #[test]
+    fn claude_session_round_trips_and_is_absent_on_a_codex_key() {
+        let claude = claude_key("launch-1", "session-1");
+        assert_eq!(claude.claude_session(), Some(("launch-1", "session-1")));
+        assert_eq!(claude.codex_thread(), None);
+
+        let codex = codex_key_for_thread("connection-a", &Value::from(1), Some("thread-a"));
+        assert_eq!(codex.claude_session(), None);
     }
 
     #[test]

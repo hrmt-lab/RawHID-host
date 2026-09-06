@@ -58,7 +58,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::debug_log::AI_DISPLAY_LOG_TARGET;
 use crate::foreground::ForegroundWatcher;
-use crate::hud_coordinator::HudCoordinator;
+use crate::hud_coordinator::{HudCoordinator, HudTargetSession};
 use crate::state::{
     add_log, AiDisplayCandidate, AiDisplaySelection, AiDisplayTarget, AppState, ClaudeIntegration,
     ClaudeLaunchIntegration, HostLinkCall, HostLinkRequest, HostLinkResponse, LogEntry,
@@ -4675,6 +4675,34 @@ fn drain_claude_state_changes(
     )
 }
 
+/// Reads the same two Claude Code display inputs `drain_claude_state_changes`
+/// returns every tick -- the current session snapshots and the `launch_id ->
+/// terminal_target_id` map -- from outside the tick loop, for a caller that
+/// needs them without also draining events. Current callers:
+/// `send_screenkey_state_immediately` (a physical-key-triggered immediate
+/// send) and `actions.rs`'s `resolve_hud_target_slot` (called from
+/// `HostActionKind::HudConfirm`), both of which need "what is Claude Code
+/// showing right now" without disturbing the tick loop's own event drain.
+///
+/// Locks `claude_integration` alone and drops the guard before returning --
+/// never call this while already holding the `hud` or `ai_display_slots`
+/// lock (see this module's and `actions.rs`'s comments on not holding one
+/// lock across another).
+pub(crate) fn claude_display_inputs(
+    integration: &Arc<Mutex<Option<ClaudeIntegration>>>,
+) -> (Vec<ClaudeSessionSnapshot>, BTreeMap<String, String>) {
+    let guard = integration.lock().unwrap();
+    let Some(integration) = guard.as_ref() else {
+        return (Vec::new(), BTreeMap::new());
+    };
+    let terminal_targets = integration
+        .launches
+        .iter()
+        .map(|(launch_id, launch)| (launch_id.clone(), launch.terminal_target_id.clone()))
+        .collect();
+    (integration.registry.snapshots(), terminal_targets)
+}
+
 fn selected_ai_output_with_targets(
     codex_snapshots: Vec<CodexSessionSnapshot>,
     codex_changes: Vec<CodexStateChange>,
@@ -5093,13 +5121,16 @@ fn screenkey_state_for_slot(
     computed
 }
 
-/// Whether a slot's own resolved Codex `(connection_id, thread_id)` is
-/// exactly the HUD's current target. `None` on either side is never a match
-/// -- a slot with no Codex target, or no HUD target at all, is not "the"
-/// target.
+/// Whether the AI session a ScreenKey slot resolved to (via
+/// `actions::hud_target_for_slot`) is exactly the HUD's current target
+/// (`HudCoordinator::target_session`), client-independent. `None` on either
+/// side is never a match -- a slot with no pending-approval target, or no
+/// HUD target at all, is not "the" target. A Codex slot can only ever equal
+/// a Codex HUD target and a Claude Code slot only a Claude Code one, since
+/// `HudTargetSession`'s variants compare unequal across clients.
 fn is_hud_target(
-    slot_target: &Option<(String, String)>,
-    hud_target: &Option<(String, String)>,
+    slot_target: &Option<HudTargetSession>,
+    hud_target: &Option<HudTargetSession>,
 ) -> bool {
     matches!((slot_target, hud_target), (Some(a), Some(b)) if a == b)
 }
@@ -5372,7 +5403,10 @@ struct KeyPressPayload {
 /// The HUD target is read once, before `ai_display_slots` is locked per
 /// slot below -- never hold both locks at once (see the `hud`/
 /// `ai_display_slots` boundary in this module's monitor loop and
-/// `actions.rs`'s `HudConfirm` arm).
+/// `actions.rs`'s `HudConfirm` arm). Claude Code's display inputs
+/// (`claude_display_inputs`) are likewise read up front, before either the
+/// `hud` or `ai_display_slots` lock is taken -- see that function's own
+/// doc comment on why.
 ///
 /// A missing slot snapshot falls back to `inactive_ai_snapshot()`; any
 /// encode or transport failure is logged via `tracing::warn!` and otherwise
@@ -5391,12 +5425,14 @@ fn send_screenkey_state_immediately(
     cause: AiWireSendCause,
     ai_client_state_send: &mut BTreeMap<u8, AiClientStateSendTracker>,
 ) {
-    let hud_target_thread = extras
+    let (claude_snapshots, claude_terminal_targets) =
+        claude_display_inputs(&extras.claude_integration);
+    let hud_target_session = extras
         .hud
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|hud| hud.target_codex_thread());
+        .and_then(|hud| hud.target_session());
     let codex_snapshots = extras.codex_activity.snapshots();
     let now = Instant::now();
 
@@ -5412,12 +5448,17 @@ fn send_screenkey_state_immediately(
                 .and_then(|entry| entry.assigned.clone());
             (
                 snapshot,
-                actions::codex_target_for_slot(assigned, codex_snapshots.clone()),
+                actions::hud_target_for_slot(
+                    assigned,
+                    &codex_snapshots,
+                    &claude_snapshots,
+                    &claude_terminal_targets,
+                ),
             )
         };
         let computed = compute_screenkey_state(
             snapshot.activity_state,
-            is_hud_target(&target, &hud_target_thread),
+            is_hud_target(&target, &hud_target_session),
         );
         let screenkey_state = screenkey_state_for_slot(slot, computed, &extras.hud_responded, now);
         let packet = match ai_client_state_packet_for_slot(snapshot, slot, screenkey_state) {
@@ -5853,18 +5894,23 @@ fn run_monitor_loop(
                 &extras.claude_permission_gate,
                 now,
             );
-        // The HUD's current Codex target, read before the `ai_display_slots`
-        // lock is taken below -- never hold both locks at once (see the
+        // The HUD's current target, read before the `ai_display_slots` lock
+        // is taken below -- never hold both locks at once (see the
         // `hud`/`ai_display_slots` boundary in `actions.rs`'s `HudConfirm`
-        // arm). Compared against each slot's own resolved Codex target to
-        // decide `AiScreenKeyState::WaitingTarget` vs `WaitingOther`; see
+        // arm). Compared against each slot's own resolved target
+        // (`actions::hud_target_for_slot`, client-independent) to decide
+        // `AiScreenKeyState::WaitingTarget` vs `WaitingOther`; see
         // `compute_screenkey_state`.
-        let hud_target_thread = extras
+        let hud_target_session = extras
             .hud
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|hud| hud.target_codex_thread());
+            .and_then(|hud| hud.target_session());
+        // `claude_snapshots` is moved into `selected_ai_output_with_targets`
+        // below, so a clone is kept here for the per-slot target resolution
+        // further down -- same reason `codex_snapshots.clone()` exists.
+        let claude_snapshots_for_targets = claude_snapshots.clone();
         let (
             ai_snapshot,
             ai_changes,
@@ -5894,13 +5940,15 @@ fn run_monitor_loop(
                     .map(|snapshot| snapshot.thread_id.clone()),
                 _ => None,
             };
-            let slot0_target = actions::codex_target_for_slot(
+            let slot0_target = actions::hud_target_for_slot(
                 selection.selected_target().cloned(),
-                codex_snapshots.clone(),
+                &codex_snapshots,
+                &claude_snapshots_for_targets,
+                &claude_terminal_targets,
             );
             let slot0_screenkey_state = compute_screenkey_state(
                 snapshot.activity_state,
-                is_hud_target(&slot0_target, &hud_target_thread),
+                is_hud_target(&slot0_target, &hud_target_session),
             );
             let retired_slots = selection.take_retired_slots();
             let extra_slots: Vec<(
@@ -5953,13 +6001,15 @@ fn run_monitor_loop(
                             .collect(),
                         None => Vec::new(),
                     };
-                    let target = actions::codex_target_for_slot(
+                    let target = actions::hud_target_for_slot(
                         entry.assigned.clone(),
-                        codex_snapshots.clone(),
+                        &codex_snapshots,
+                        &claude_snapshots_for_targets,
+                        &claude_terminal_targets,
                     );
                     let screenkey_state = compute_screenkey_state(
                         snapshot.activity_state,
-                        is_hud_target(&target, &hud_target_thread),
+                        is_hud_target(&target, &hud_target_session),
                     );
                     (entry.slot, snapshot, changes, entry.epoch, screenkey_state)
                 })
@@ -7027,13 +7077,107 @@ mod tests {
 
     #[test]
     fn is_hud_target_requires_both_sides_present_and_equal() {
-        let a = Some(("connection-a".to_string(), "thread-a".to_string()));
-        let b = Some(("connection-b".to_string(), "thread-b".to_string()));
+        let a = Some(HudTargetSession::Codex {
+            connection_id: "connection-a".to_string(),
+            thread_id: "thread-a".to_string(),
+        });
+        let b = Some(HudTargetSession::Codex {
+            connection_id: "connection-b".to_string(),
+            thread_id: "thread-b".to_string(),
+        });
         assert!(is_hud_target(&a, &a));
         assert!(!is_hud_target(&a, &b));
         assert!(!is_hud_target(&a, &None));
         assert!(!is_hud_target(&None, &a));
         assert!(!is_hud_target(&None, &None));
+    }
+
+    /// Client-independent: `is_hud_target` must compare Claude Code variants
+    /// the same way it compares Codex ones, and a Codex slot must never be
+    /// treated as a match for a Claude Code HUD target (or vice versa) even
+    /// though both are `Some` -- `HudTargetSession`'s derived `PartialEq`
+    /// already guarantees this across enum variants, but this pins the
+    /// behavior at the call site that actually matters for ScreenKey display.
+    #[test]
+    fn is_hud_target_matches_claude_variants_and_rejects_cross_client_pairs() {
+        let claude_a = Some(HudTargetSession::Claude {
+            launch_id: "launch-1".to_string(),
+            session_id: "session-1".to_string(),
+        });
+        let claude_b = Some(HudTargetSession::Claude {
+            launch_id: "launch-1".to_string(),
+            session_id: "session-2".to_string(),
+        });
+        let codex = Some(HudTargetSession::Codex {
+            connection_id: "connection-a".to_string(),
+            thread_id: "thread-a".to_string(),
+        });
+        assert!(is_hud_target(&claude_a, &claude_a));
+        assert!(!is_hud_target(&claude_a, &claude_b));
+        assert!(!is_hud_target(&claude_a, &codex));
+        assert!(!is_hud_target(&codex, &claude_a));
+    }
+
+    /// End-to-end through the two pieces the monitor loop actually composes
+    /// for a Claude Code slot: `actions::hud_target_for_slot` resolves the
+    /// slot's live session, and `compute_screenkey_state` turns that
+    /// waiting/target status into `WaitingTarget` when it matches the HUD's
+    /// current target, or `WaitingOther` when it does not. Before
+    /// `hud_target_for_slot` existed, ScreenKey's target display was wired up
+    /// for Codex only -- a Claude Code slot never reached a target comparison
+    /// at all, by stage 3's deliberate scope limit, so it could never show
+    /// `WaitingTarget`. This test pins the fix: a Claude Code slot now
+    /// reaches `WaitingTarget` exactly when it is the HUD's target, the same
+    /// as a Codex slot always could.
+    #[test]
+    fn claude_slot_reaches_waiting_target_only_when_it_is_the_hud_target() {
+        let claude_terminal_targets =
+            BTreeMap::from([("launch-1".to_string(), "terminal-a".to_string())]);
+        let claude_snapshots = vec![claude_session(
+            "session-1",
+            AiActivityState::WaitingApproval,
+            1,
+        )];
+        let assigned = Some(AiDisplayTarget::Claude {
+            terminal_target_id: "terminal-a".to_string(),
+        });
+
+        let slot_target = actions::hud_target_for_slot(
+            assigned,
+            &[],
+            &claude_snapshots,
+            &claude_terminal_targets,
+        );
+        assert_eq!(
+            slot_target,
+            Some(HudTargetSession::Claude {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            })
+        );
+
+        // The slot's own resolved session is the HUD's current target.
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&slot_target, &slot_target)
+            ),
+            AiScreenKeyState::WaitingTarget
+        );
+
+        // A different session is currently the HUD's target: the slot still
+        // shows as waiting, but not as the target.
+        let other_hud_target = Some(HudTargetSession::Claude {
+            launch_id: "launch-other".to_string(),
+            session_id: "session-other".to_string(),
+        });
+        assert_eq!(
+            compute_screenkey_state(
+                AiActivityState::WaitingApproval,
+                is_hud_target(&slot_target, &other_hud_target)
+            ),
+            AiScreenKeyState::WaitingOther
+        );
     }
 
     #[test]
@@ -7135,8 +7279,14 @@ mod tests {
         // that motivated `send_screenkey_state_immediately`, since neither
         // slot's `activity_state` moves. The new slot's own resolved Codex
         // target now matches the HUD's target; the old slot's does not.
-        let old_target = Some(("connection-a".to_string(), "thread-a".to_string()));
-        let new_target = Some(("connection-b".to_string(), "thread-b".to_string()));
+        let old_target = Some(HudTargetSession::Codex {
+            connection_id: "connection-a".to_string(),
+            thread_id: "thread-a".to_string(),
+        });
+        let new_target = Some(HudTargetSession::Codex {
+            connection_id: "connection-b".to_string(),
+            thread_id: "thread-b".to_string(),
+        });
 
         // Before the switch: HUD target is the old slot's session.
         assert_eq!(

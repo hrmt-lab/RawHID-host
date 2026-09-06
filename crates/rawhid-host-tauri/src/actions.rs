@@ -3,10 +3,12 @@
 //! allowlist. The HID value byte is never interpreted as a path or command.
 
 use std::{
+    collections::BTreeMap,
     sync::{atomic::Ordering, Arc, Mutex},
     time::Instant,
 };
 
+use rawhid_host_core::claude_activity::ClaudeSessionSnapshot;
 use rawhid_host_core::claude_decision::ClaudePermissionGate;
 use rawhid_host_core::codex_activity::CodexSessionSnapshot;
 use rawhid_host_core::config::{ActionBinding, HostActionKind};
@@ -16,17 +18,18 @@ use tauri::{AppHandle, Manager};
 use crate::state::{AiDisplayTarget, MonitorStatus};
 use crate::{
     commands::{
-        respond_to_claude_approval_internal, respond_to_codex_approval_internal,
-        spawn_ai_refresh_watcher, MonitorExtras,
+        claude_display_inputs, respond_to_claude_approval_internal,
+        respond_to_codex_approval_internal, spawn_ai_refresh_watcher, MonitorExtras,
     },
-    hud_coordinator::HudSelectionDirection,
+    hud_coordinator::{HudSelectionDirection, HudTargetSession},
 };
 
 pub enum ActionOutcome {
     Continue,
     /// A valid physical HUD action had no safe live target. It is deliberately
-    /// non-fatal: stale packets, Claude slots, and double presses must never
-    /// turn into a synthetic approval.
+    /// non-fatal: stale packets, a slot with no pending approval (of either
+    /// client), and double presses must never turn into a synthetic
+    /// approval.
     HudNoop {
         reason: &'static str,
     },
@@ -157,7 +160,7 @@ pub fn execute(
             // lock (`ai_display_slots`) below -- see this module's
             // `move_hud_selection_and_render` doc comment on not holding the
             // lock used for one step across another.
-            let (dispatch, target_thread) = {
+            let (dispatch, target_session) = {
                 let hud_guard = extras.hud.lock().unwrap();
                 let Some(hud) = hud_guard.as_ref() else {
                     return Ok(ActionOutcome::HudNoop {
@@ -165,11 +168,11 @@ pub fn execute(
                     });
                 };
                 let dispatch = hud.begin_response(&pending, Instant::now());
-                let target_thread = match &dispatch {
-                    Some(_) => hud.target_codex_thread(),
+                let target_session = match &dispatch {
+                    Some(_) => hud.target_session(),
                     None => None,
                 };
-                (dispatch, target_thread)
+                (dispatch, target_session)
             };
             let Some(dispatch) = dispatch else {
                 return Ok(ActionOutcome::HudNoop {
@@ -184,7 +187,7 @@ pub fn execute(
                 Arc::clone(&extras.claude_permission_gate),
                 dispatch,
             );
-            let slot = target_thread.and_then(|target| resolve_hud_target_slot(extras, &target));
+            let slot = target_session.and_then(|target| resolve_hud_target_slot(extras, &target));
             match slot {
                 Some(slot) => Ok(ActionOutcome::HudResponded { slot }),
                 None => Ok(ActionOutcome::Continue),
@@ -211,20 +214,40 @@ pub fn execute(
                 .slots()
                 .get(usize::from(value))
                 .and_then(|slot| slot.assigned.clone());
-            let target = codex_target_for_slot(assigned, extras.codex_activity.snapshots());
+            // Claude Code's display inputs are read here, after the
+            // `ai_display_slots` lock above has already been dropped and
+            // before the `hud` lock below is taken -- never hold either of
+            // those locks across `claude_display_inputs` (see its own doc
+            // comment).
+            let codex_snapshots = extras.codex_activity.snapshots();
+            let (claude_snapshots, claude_terminal_targets) =
+                claude_display_inputs(&extras.claude_integration);
+            let target = hud_target_for_slot(
+                assigned,
+                &codex_snapshots,
+                &claude_snapshots,
+                &claude_terminal_targets,
+            );
             // ScreenKey's uplink means "make this session the one I'm
             // dealing with" (docs/ai-approval-hud-design.md §6.1/§11): a
             // slot with nothing waiting for HUD approval falls back to the
             // same terminal-focus behavior as a standalone FocusAiTerminal
             // press, rather than staying a silent HudNoop.
-            let Some((connection_id, thread_id)) = target else {
+            let Some(target) = target else {
                 return focus_ai_terminal_for_slot(value, extras);
             };
             let pending = extras.codex_activity.pending_approvals();
             let selected = {
                 let hud = extras.hud.lock().unwrap();
-                hud.as_ref().is_some_and(|hud| {
-                    hud.select_codex_thread(&pending, &connection_id, &thread_id)
+                hud.as_ref().is_some_and(|hud| match &target {
+                    HudTargetSession::Codex {
+                        connection_id,
+                        thread_id,
+                    } => hud.select_codex_thread(&pending, connection_id, thread_id),
+                    HudTargetSession::Claude {
+                        launch_id,
+                        session_id,
+                    } => hud.select_claude_session(&pending, launch_id, session_id),
                 })
             };
             if !selected {
@@ -329,21 +352,33 @@ fn focus_ai_terminal_for_slot(value: u8, extras: &MonitorExtras) -> Result<Actio
     Ok(ActionOutcome::Continue)
 }
 
-/// Finds which ScreenKey slot is assigned the exact Codex `(connection_id,
-/// thread_id)` that just received a HUD answer, by reusing the same
-/// predicate (`codex_target_for_slot`) that decides whether a slot is the
-/// HUD's current target elsewhere (`commands.rs`'s per-slot ScreenKey state
-/// calculation, `HostActionKind::SelectHudTarget` above). Reusing rather than
-/// re-deriving this comparison is deliberate -- see the 2026-09-04 handoff
-/// note on keeping "which slot counts as the target" as one predicate.
-fn resolve_hud_target_slot(extras: &MonitorExtras, target: &(String, String)) -> Option<u8> {
-    let snapshots = extras.codex_activity.snapshots();
+/// Finds which ScreenKey slot is assigned the exact AI session that just
+/// received a HUD answer, by reusing the same predicate
+/// (`hud_target_for_slot`) that decides whether a slot is the HUD's current
+/// target elsewhere (`commands.rs`'s per-slot ScreenKey state calculation,
+/// `HostActionKind::SelectHudTarget` above). Reusing rather than re-deriving
+/// this comparison is deliberate -- see the 2026-09-04 handoff note on
+/// keeping "which slot counts as the target" as one predicate.
+///
+/// Reads Claude Code's display inputs via `claude_display_inputs` before
+/// locking `ai_display_slots` below, never while holding it -- see that
+/// function's own doc comment.
+fn resolve_hud_target_slot(extras: &MonitorExtras, target: &HudTargetSession) -> Option<u8> {
+    let codex_snapshots = extras.codex_activity.snapshots();
+    let (claude_snapshots, claude_terminal_targets) =
+        claude_display_inputs(&extras.claude_integration);
     let slots = extras.ai_display_slots.lock().unwrap();
     slots
         .slots()
         .iter()
         .find(|entry| {
-            codex_target_for_slot(entry.assigned.clone(), snapshots.clone()).as_ref()
+            hud_target_for_slot(
+                entry.assigned.clone(),
+                &codex_snapshots,
+                &claude_snapshots,
+                &claude_terminal_targets,
+            )
+            .as_ref()
                 == Some(target)
         })
         .map(|entry| entry.slot)
@@ -366,6 +401,103 @@ pub(crate) fn codex_target_for_slot(
                 && snapshot.terminal_target_id == terminal_target_id
         })
         .map(|snapshot| (snapshot.owner_connection_id, snapshot.thread_id))
+}
+
+/// The Claude Code counterpart to `codex_target_for_slot`: finds the
+/// `(launch_id, session_id)` a ScreenKey slot's assigned Claude Code display
+/// target currently maps to, restricted to the one session actually eligible
+/// to answer a HUD approval for it. `assigned` names a terminal
+/// (`AiDisplayTarget::Claude`'s `terminal_target_id`), and one launch can
+/// have more than one recorded `ClaudeSessionSnapshot` over its lifetime (a
+/// previous session ended and a new one started in the same terminal without
+/// the wrapper process itself restarting), so a terminal match alone is not
+/// enough.
+///
+/// The winning snapshot must satisfy all of:
+/// 1. `session_active`.
+/// 2. `claude_terminal_targets.get(&snapshot.launch_id) == Some(&terminal_target_id)`
+///    -- the slot's terminal belongs to this launch.
+/// 3. It is that launch's current *display* session: no other active
+///    snapshot sharing the same `launch_id` has a larger
+///    `registration_order`. This is the exact same filter `commands.rs`'s
+///    `selected_ai_output_with_targets` applies when building its display
+///    candidates -- a slot only ever shows one session per launch, so its
+///    HUD target must be that same session, never an older, already-retired
+///    one that happens to share the launch.
+/// 4. `activity_state == WaitingApproval`, mirroring `codex_target_for_slot`
+///    -- `WaitingInput` never has a `PendingApprovalStore` entry, so it can
+///    never be a HUD target either.
+fn claude_target_for_slot(
+    assigned: Option<AiDisplayTarget>,
+    claude_snapshots: &[ClaudeSessionSnapshot],
+    claude_terminal_targets: &BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    let AiDisplayTarget::Claude { terminal_target_id } = assigned? else {
+        return None;
+    };
+    claude_snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.session_active
+                && claude_terminal_targets.get(&snapshot.launch_id) == Some(&terminal_target_id)
+                && !claude_snapshots.iter().any(|other| {
+                    other.session_active
+                        && other.launch_id == snapshot.launch_id
+                        && other.registration_order > snapshot.registration_order
+                })
+                && snapshot.activity_state
+                    == rawhid_host_core::packet::AiActivityState::WaitingApproval
+        })
+        .map(|snapshot| (snapshot.launch_id.clone(), snapshot.session_id.clone()))
+}
+
+/// The single entry point for "is this ScreenKey slot the HUD's current
+/// target", client-independent -- no second function may answer this
+/// question. This carries forward the same discipline `resolve_hud_target_slot`
+/// above already documents ("keeping 'which slot counts as the target' as
+/// one predicate"), which exists because of the 2026-09-04 handoff note: that
+/// bug was a *Codex-only* split between the predicate that picks display
+/// candidates and the one that filters state changes, which let a throwaway
+/// Codex thread's state change leak onto a slot displaying a different
+/// thread. It was never about Claude Code -- Claude Code simply never
+/// reached a target comparison at all before this change, by stage 3's
+/// deliberate scope limit, not as a regression of that bug. Every call site
+/// that needs this answer -- `commands.rs`'s per-slot ScreenKey state
+/// calculation, `HostActionKind::SelectHudTarget` above,
+/// `resolve_hud_target_slot` above -- must go through this function. It only
+/// ever dispatches to `codex_target_for_slot`/`claude_target_for_slot` by
+/// `assigned`'s variant and wraps the result as a `HudTargetSession`; those
+/// two are otherwise private to this decision (tests aside).
+pub(crate) fn hud_target_for_slot(
+    assigned: Option<AiDisplayTarget>,
+    codex_snapshots: &[CodexSessionSnapshot],
+    claude_snapshots: &[ClaudeSessionSnapshot],
+    claude_terminal_targets: &BTreeMap<String, String>,
+) -> Option<HudTargetSession> {
+    match assigned {
+        Some(AiDisplayTarget::Codex { terminal_target_id }) => {
+            let (connection_id, thread_id) = codex_target_for_slot(
+                Some(AiDisplayTarget::Codex { terminal_target_id }),
+                codex_snapshots.to_vec(),
+            )?;
+            Some(HudTargetSession::Codex {
+                connection_id,
+                thread_id,
+            })
+        }
+        Some(AiDisplayTarget::Claude { terminal_target_id }) => {
+            let (launch_id, session_id) = claude_target_for_slot(
+                Some(AiDisplayTarget::Claude { terminal_target_id }),
+                claude_snapshots,
+                claude_terminal_targets,
+            )?;
+            Some(HudTargetSession::Claude {
+                launch_id,
+                session_id,
+            })
+        }
+        None => None,
+    }
 }
 
 fn dispatch_hud_response(
@@ -439,12 +571,14 @@ fn spawn_response_task(task: impl FnOnce() + Send + 'static) {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::mpsc,
         time::{Duration, Instant},
     };
 
     use futures_util::{SinkExt, StreamExt};
     use rawhid_host_core::{
+        claude_activity::ClaudeSessionSnapshot,
         claude_decision::ClaudePermissionGate,
         codex_activity::{AiClientStateSnapshot, CodexActivityRuntime, CodexSessionSnapshot},
         codex_broker::{test_support::BrokerHarness, CodexApprovalResponseOutcome},
@@ -464,7 +598,7 @@ mod tests {
     use crate::{
         hud_coordinator::{
             response_selection_from_state, HudInteractionState, HudSelectionDirection,
-            HUD_CONFIRM_GUARD,
+            HudTargetSession, HUD_CONFIRM_GUARD,
         },
         state::AiDisplayTarget,
     };
@@ -489,6 +623,162 @@ mod tests {
             },
             is_display_target: true,
         }
+    }
+
+    fn claude_snapshot(
+        launch_id: &str,
+        session_id: &str,
+        activity_state: AiActivityState,
+        registration_order: u64,
+    ) -> ClaudeSessionSnapshot {
+        ClaudeSessionSnapshot {
+            launch_id: launch_id.to_string(),
+            session_id: session_id.to_string(),
+            registration_order,
+            session_active: true,
+            activity_state,
+            work_phase: AiWorkPhase::Unspecified,
+            desynchronized: false,
+            revision: 1,
+        }
+    }
+
+    fn claude_terminal_targets(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(launch_id, terminal_target_id)| {
+                (launch_id.to_string(), terminal_target_id.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_slot_selection_finds_the_launchs_current_waiting_approval_session() {
+        let targets = claude_terminal_targets(&[("launch-1", "terminal-a")]);
+        let target = super::claude_target_for_slot(
+            Some(AiDisplayTarget::Claude {
+                terminal_target_id: "terminal-a".to_string(),
+            }),
+            &[claude_snapshot(
+                "launch-1",
+                "session-1",
+                AiActivityState::WaitingApproval,
+                1,
+            )],
+            &targets,
+        );
+        assert_eq!(
+            target,
+            Some(("launch-1".to_string(), "session-1".to_string()))
+        );
+    }
+
+    /// Condition 3 of `claude_target_for_slot`: a newer active session of the
+    /// same launch means the older `WaitingApproval` session is no longer the
+    /// launch's *display* session, so it must not become the HUD target --
+    /// even though the newer session itself is not `WaitingApproval` either
+    /// (it fails condition 4), the overall result must still be `None`, not
+    /// a fallback to the older session.
+    #[test]
+    fn claude_slot_selection_ignores_a_retired_session_when_a_newer_one_is_active() {
+        let targets = claude_terminal_targets(&[("launch-1", "terminal-a")]);
+        let snapshots = [
+            claude_snapshot("launch-1", "session-1", AiActivityState::WaitingApproval, 1),
+            claude_snapshot("launch-1", "session-2", AiActivityState::Working, 2),
+        ];
+        assert!(super::claude_target_for_slot(
+            Some(AiDisplayTarget::Claude {
+                terminal_target_id: "terminal-a".to_string(),
+            }),
+            &snapshots,
+            &targets,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_slot_selection_requires_the_terminal_to_belong_to_the_same_launch() {
+        let targets = claude_terminal_targets(&[("launch-other", "terminal-a")]);
+        let snapshots = [claude_snapshot(
+            "launch-1",
+            "session-1",
+            AiActivityState::WaitingApproval,
+            1,
+        )];
+        assert!(super::claude_target_for_slot(
+            Some(AiDisplayTarget::Claude {
+                terminal_target_id: "terminal-a".to_string(),
+            }),
+            &snapshots,
+            &targets,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_slot_selection_returns_none_for_a_codex_display_target() {
+        let snapshots = [claude_snapshot(
+            "launch-1",
+            "session-1",
+            AiActivityState::WaitingApproval,
+            1,
+        )];
+        assert!(super::claude_target_for_slot(
+            Some(AiDisplayTarget::Codex {
+                terminal_target_id: "terminal-a".to_string(),
+            }),
+            &snapshots,
+            &BTreeMap::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hud_target_for_slot_dispatches_by_assigned_variant() {
+        let codex_snapshots = [codex_snapshot("connection-a", "thread-a", "terminal-codex")];
+        let claude_snapshots = [claude_snapshot(
+            "launch-1",
+            "session-1",
+            AiActivityState::WaitingApproval,
+            1,
+        )];
+        let claude_targets = claude_terminal_targets(&[("launch-1", "terminal-claude")]);
+
+        assert_eq!(
+            super::hud_target_for_slot(
+                Some(AiDisplayTarget::Codex {
+                    terminal_target_id: "terminal-codex".to_string(),
+                }),
+                &codex_snapshots,
+                &claude_snapshots,
+                &claude_targets,
+            ),
+            Some(HudTargetSession::Codex {
+                connection_id: "connection-a".to_string(),
+                thread_id: "thread-a".to_string(),
+            })
+        );
+        assert_eq!(
+            super::hud_target_for_slot(
+                Some(AiDisplayTarget::Claude {
+                    terminal_target_id: "terminal-claude".to_string(),
+                }),
+                &codex_snapshots,
+                &claude_snapshots,
+                &claude_targets,
+            ),
+            Some(HudTargetSession::Claude {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            })
+        );
+        assert!(super::hud_target_for_slot(
+            None,
+            &codex_snapshots,
+            &claude_snapshots,
+            &claude_targets,
+        )
+        .is_none());
     }
 
     #[test]

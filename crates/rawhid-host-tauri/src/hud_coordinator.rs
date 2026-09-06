@@ -247,6 +247,28 @@ pub enum HudSelectionDirection {
     Next,
 }
 
+/// The exact AI session the HUD currently targets, client-independent. This
+/// is the single value `actions.rs`'s `hud_target_for_slot` and this
+/// module's `target_session` deal in -- every "is this slot the HUD's
+/// target" comparison in the Host must go through one of those two, not a
+/// per-client pair of fields, so a fix to one client's targeting can never
+/// again leave the other's display broken (see the 2026-09-04 handoff note).
+///
+/// Internal only, like `ApprovalKey::codex_thread`/`claude_session`: built
+/// purely for Host-side slot/target matching, and its fields must never be
+/// placed in a HUD payload or a Host Link packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HudTargetSession {
+    Codex {
+        connection_id: String,
+        thread_id: String,
+    },
+    Claude {
+        launch_id: String,
+        session_id: String,
+    },
+}
+
 /// An exact pending request and a safe index into that request's current
 /// `availableDecisions` array. Both values are derived from Host state; no
 /// approval id or decision value is reconstructed here.
@@ -499,6 +521,70 @@ fn begin_response_from_state(
     })
 }
 
+/// Shared core of `select_codex_thread`/`select_claude_session`: makes
+/// `key`/`snapshot` (already resolved by the caller as the exact live
+/// request to target) the explicit HUD selection. Factored out as a free
+/// function, taking the interaction lock directly, so it -- and the
+/// `target_session_from_state` counterpart below -- can be exercised in
+/// tests without a `HudWindow`/`AppHandle`, the same reason
+/// `begin_response_from_state` above is a free function rather than a
+/// `HudCoordinator` method.
+fn select_target_from_state(
+    interaction: &Mutex<HudInteractionState>,
+    key: &ApprovalKey,
+    snapshot: &PendingApprovalSnapshot,
+) {
+    interaction.lock().unwrap().select_target(
+        key,
+        snapshot_decision_count(snapshot),
+        Instant::now(),
+    );
+}
+
+/// Shared core of `select_claude_session`, including the precondition lookup
+/// itself (unlike `select_target_from_state`, which assumes the caller
+/// already resolved a live `key`/`snapshot`) -- the same shape as
+/// `begin_response_from_state` above, and for the same reason: a test
+/// exercising "select an absent session" needs to observe the whole failure
+/// path (the store lookup finding nothing, `false` returned, no state
+/// mutated), not just the tail end of it. An absent entry leaves
+/// `interaction` untouched: a failed selection must never clear or otherwise
+/// disturb whatever target was already live.
+fn select_claude_session_from_state(
+    interaction: &Mutex<HudInteractionState>,
+    pending: &PendingApprovalStore,
+    launch_id: &str,
+    session_id: &str,
+) -> bool {
+    let key = rawhid_host_core::pending_approval::claude_key(launch_id, session_id);
+    let Some(snapshot) = pending.get(&key) else {
+        return false;
+    };
+    select_target_from_state(interaction, &key, &snapshot);
+    true
+}
+
+/// Shared core of `target_session`. See `select_target_from_state`'s doc
+/// comment for why this is a free function taking the interaction lock
+/// directly rather than a `HudCoordinator` method body.
+fn target_session_from_state(interaction: &Mutex<HudInteractionState>) -> Option<HudTargetSession> {
+    let interaction = interaction.lock().unwrap();
+    let key = interaction.target()?;
+    if let Some((connection_id, thread_id)) = key.codex_thread() {
+        return Some(HudTargetSession::Codex {
+            connection_id: connection_id.to_string(),
+            thread_id: thread_id.to_string(),
+        });
+    }
+    if let Some((launch_id, session_id)) = key.claude_session() {
+        return Some(HudTargetSession::Claude {
+            launch_id: launch_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+    None
+}
+
 /// Owns the HUD `WebviewWindow` and tracks which pending-approval entry (if
 /// any) it currently shows. Created once at startup and shared with the
 /// host-link monitor thread via `MonitorExtras` (`commands.rs`), so it must
@@ -611,9 +697,10 @@ impl HudCoordinator {
     }
 
     /// Makes the newest Codex approval belonging to this exact display
-    /// connection and thread the explicit HUD target. Claude and unassigned
-    /// slots never reach this method, and an absent or threadless request is
-    /// a benign no-op.
+    /// connection and thread the explicit HUD target. Unassigned slots never
+    /// reach this method (they fall back to `focus_ai_terminal_for_slot`
+    /// before ever calling here -- see `actions.rs`'s `SelectHudTarget` arm),
+    /// and an absent or threadless request is a benign no-op.
     pub fn select_codex_thread(
         &self,
         pending: &PendingApprovalStore,
@@ -625,12 +712,25 @@ impl HudCoordinator {
         else {
             return false;
         };
-        self.interaction.lock().unwrap().select_target(
-            &key,
-            snapshot_decision_count(&snapshot),
-            Instant::now(),
-        );
+        select_target_from_state(&self.interaction, &key, &snapshot);
         true
+    }
+
+    /// Makes the one unresolved Claude Code request for this exact
+    /// `(launch_id, session_id)` the explicit HUD target. Unlike
+    /// `select_codex_thread`, this never needs to search
+    /// `PendingApprovalStore` for "the newest" match: `claude_key` derives a
+    /// single deterministic key from `(launch_id, session_id)` (one session
+    /// holds at most one unresolved request -- see that function's own doc
+    /// comment), so a direct `get` is exact by construction. An absent entry
+    /// is a benign no-op, same as `select_codex_thread`.
+    pub fn select_claude_session(
+        &self,
+        pending: &PendingApprovalStore,
+        launch_id: &str,
+        session_id: &str,
+    ) -> bool {
+        select_claude_session_from_state(&self.interaction, pending, launch_id, session_id)
     }
 
     /// Returns when the current opaque target began displaying. A future
@@ -641,17 +741,17 @@ impl HudCoordinator {
         self.interaction.lock().unwrap().shown_at()
     }
 
-    /// The exact Codex `(connection_id, thread_id)` of the request currently
-    /// shown as the HUD target, for slot-vs-target comparisons
-    /// (`actions.rs`'s `codex_target_for_slot`, `commands.rs`'s per-slot
-    /// ScreenKey state calculation). `None` when nothing is shown, or the
-    /// target is a Claude Code request, or its thread id is unknown. Like
-    /// `ApprovalKey::codex_thread`, the returned pair must never reach a HUD
-    /// payload or a Host Link packet.
-    pub fn target_codex_thread(&self) -> Option<(String, String)> {
-        let interaction = self.interaction.lock().unwrap();
-        let (connection_id, thread_id) = interaction.target()?.codex_thread()?;
-        Some((connection_id.to_string(), thread_id.to_string()))
+    /// The exact AI session currently shown as the HUD target, client-
+    /// independent, for slot-vs-target comparisons (`actions.rs`'s
+    /// `hud_target_for_slot`, `commands.rs`'s per-slot ScreenKey state
+    /// calculation). `None` when nothing is shown, or the target's client
+    /// identity could not be determined (a Codex request with an unknown
+    /// thread id, or a key built via `ApprovalKey::new`, which should not
+    /// happen in production for either client). Like `ApprovalKey::
+    /// codex_thread`/`claude_session`, the returned value must never reach a
+    /// HUD payload or a Host Link packet.
+    pub fn target_session(&self) -> Option<HudTargetSession> {
+        target_session_from_state(&self.interaction)
     }
 
     fn show(&self) {
@@ -756,15 +856,17 @@ mod tests {
     };
 
     use rawhid_host_core::pending_approval::{
-        codex_key, ApprovalClient, ApprovalOwner, PendingApprovalBody, PendingApprovalStore,
+        claude_key, codex_key, codex_key_for_thread, ApprovalClient, ApprovalOwner,
+        PendingApprovalBody, PendingApprovalStore,
     };
     use serde_json::{json, Value};
 
     use super::{
         begin_response_from_state, claude_allow_with_permissions_label, claude_decision_labels,
         current_target, reject_decision_index_from_body, replace_shown,
-        response_selection_from_state, ApprovalKey, HudInteractionState, HudSelectionDirection,
-        Instant, HUD_CONFIRM_GUARD,
+        response_selection_from_state, select_claude_session_from_state, select_target_from_state,
+        target_session_from_state, ApprovalKey, HudInteractionState, HudSelectionDirection,
+        HudTargetSession, Instant, HUD_CONFIRM_GUARD,
     };
 
     fn body(decisions: Vec<Value>) -> PendingApprovalBody {
@@ -1308,5 +1410,106 @@ mod tests {
 
         let empty_decisions = body(vec![]);
         assert_eq!(claude_decision_labels(&empty_decisions), None);
+    }
+
+    fn insert_claude(
+        store: &PendingApprovalStore,
+        launch_id: &str,
+        session_id: &str,
+        decisions: Vec<Value>,
+    ) -> ApprovalKey {
+        let key = claude_key(launch_id, session_id);
+        store.insert(
+            key.clone(),
+            ApprovalClient::ClaudeCode,
+            ApprovalOwner::ClaudeSession {
+                launch_id: launch_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+            body(decisions),
+        );
+        key
+    }
+
+    /// Client-independent targeting, Claude Code side, through
+    /// `select_claude_session_from_state` itself (not just the pure state it
+    /// wraps): selecting a real `(launch_id, session_id)` returns `true` and
+    /// `target_session_from_state` then reports `HudTargetSession::Claude`;
+    /// selecting a `(launch_id, session_id)` with no entry then returns
+    /// `false` and leaves that same target in place. The second half is the
+    /// property that actually matters -- a failed selection must never clear
+    /// or replace whatever was already live -- so it must be checked as a
+    /// continuation of the first selection, not against a fresh, empty
+    /// `HudInteractionState` (which would pass even if `select_claude_session`
+    /// mistakenly selected the wrong entry).
+    #[test]
+    fn select_claude_session_selects_a_real_session_and_leaves_it_alone_on_failure() {
+        let store = PendingApprovalStore::new();
+        insert_claude(&store, "launch-1", "session-1", vec![json!("allow")]);
+        let interaction = Mutex::new(HudInteractionState::default());
+
+        assert!(select_claude_session_from_state(
+            &interaction,
+            &store,
+            "launch-1",
+            "session-1",
+        ));
+        assert_eq!(
+            target_session_from_state(&interaction),
+            Some(HudTargetSession::Claude {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            })
+        );
+
+        // No entry exists for this pair, so `execute()`'s `SelectHudTarget`
+        // arm would fall back to `focus_ai_terminal_for_slot` instead of
+        // selecting -- and the previously selected session above must still
+        // be the reported target.
+        assert!(!select_claude_session_from_state(
+            &interaction,
+            &store,
+            "launch-1",
+            "session-missing",
+        ));
+        assert_eq!(
+            target_session_from_state(&interaction),
+            Some(HudTargetSession::Claude {
+                launch_id: "launch-1".to_string(),
+                session_id: "session-1".to_string(),
+            })
+        );
+    }
+
+    /// `target_session` reports the Codex variant for a Codex-selected
+    /// target, matching `target_codex_thread`'s previous behavior before it
+    /// was folded into this client-independent method. Uses
+    /// `codex_key_for_thread` directly (rather than `insert_codex`'s plain
+    /// `codex_key`) because only a key built with a known thread id has
+    /// anything for `codex_thread`/`target_session` to report.
+    #[test]
+    fn target_session_reports_the_codex_variant_for_a_codex_target() {
+        let store = PendingApprovalStore::new();
+        let key = codex_key_for_thread("connection-a", &json!(1), Some("thread-a"));
+        store.insert(
+            key.clone(),
+            ApprovalClient::Codex,
+            ApprovalOwner::Codex {
+                connection_id: "connection-a".to_string(),
+            },
+            body(vec![json!("approve")]),
+        );
+        let interaction = Mutex::new(HudInteractionState::default());
+
+        let snapshot = store.get(&key).unwrap();
+        select_target_from_state(&interaction, &key, &snapshot);
+
+        assert_eq!(
+            target_session_from_state(&interaction),
+            Some(HudTargetSession::Codex {
+                connection_id: "connection-a".to_string(),
+                thread_id: "thread-a".to_string(),
+            })
+        );
     }
 }
